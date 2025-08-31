@@ -18,9 +18,16 @@ ODDS = {-80: 20, -75: 18, -70: 15, -60: 12, -50: 10, -45: 9, -40: 8, -35: 7, -30
 NORMAL_STOCK_CHANGES = tuple(ODDS.keys())
 BOT_COLOUR = Colour.from_rgb(169, 46, 33)
 MAX_PLAYERS = 24
+ALLOWED_SIGNUP_CHANNEL_ID = 1309822981576593408  # /signup join Allowed Channel
+
+COLOR_NAME_RE = re.compile(r'^[A-Za-z ]{3,20}$')
 HEX_RE = re.compile(r'^#?(?:[0-9a-fA-F]{6})$')
 
+STARTING_CASH = 500_000
+MAX_ITEM_UNITS = 9_999_999
+ITEM_CODES = list("ABCDEFGH")
 
+# Base Format Layers
 def format_bank_history(history: list[dict]):
     history_text = ""
     for entry in history:
@@ -40,7 +47,6 @@ def format_bank_history(history: list[dict]):
                             f"Reason: {entry['reason']}\n"
     return history_text
 
-
 def format_history_embed(view: View):
     history_text = format_bank_history(view.history[view.index])
     history_embed = Embed(
@@ -55,7 +61,6 @@ def format_history_embed(view: View):
         history_embed = history_embed.set_author(name=f"{view.bank_owner.name}#{view.bank_owner.discriminator}",
                                                  icon_url=user_avatar)
     return history_embed
-
 
 def format_balance_embed(view: View):
     balance_embed = Embed(
@@ -88,6 +93,64 @@ def _colour_from_hex(hex_str: str) -> Colour:
     b = int(hex_str[5:7], 16)
     return Colour.from_rgb(r, g, b)
 
+def _now_ts() -> int:
+    return int(datetime.now().timestamp())
+
+async def _get_market_config():
+    return await db_client.market.config.find_one({"_id": "current"})  # {"items":{A:{name,price},...}}
+
+def _resolve_item_code(cfg_items: dict, ident: str) -> str | None:
+    """
+    ident: 'A'~'H' or configured name (case-insensitive).
+    returns canonical item code 'A'~'H' or None.
+    """
+    if not ident:
+        return None
+    ident = ident.strip()
+    up = ident.upper()
+    if up in ITEM_CODES:
+        return up
+    # match by name
+    for code in ITEM_CODES:
+        nm = cfg_items.get(code, {}).get("name", "")
+        if nm.lower() == ident.lower():
+            return code
+    return None
+
+def _parse_orders(orders_raw: str) -> list[tuple[str, int]]:
+    """
+    Parse pairs from a free-form string.
+    Accept separators: comma, pipe, semicolon, newline.
+    Each pair is like: 'A 10' / 'Apple 5'
+    """
+    parts = re.split(r'[,\|\n;]+', orders_raw.strip())
+    parsed: list[tuple[str,int]] = []
+    for part in parts:
+        t = part.strip()
+        if not t:
+            continue
+        # e.g. "A 10" / "Ocean Blue 3"
+        m = re.match(r'(.+?)\s+(\d+)$', t)
+        if not m:
+            # allow "A:10" or "A=10"
+            m = re.match(r'(.+?)\s*[:=]\s*(\d+)$', t)
+        if not m:
+            raise ValueError(f"Cannot parse pair: '{t}' (use 'ItemName 10' or 'A 10')")
+        name = m.group(1).strip()
+        qty = int(m.group(2))
+        if qty < 1 or qty > MAX_ITEM_UNITS:
+            raise ValueError(f"Quantity out of range for '{t}' (1~{MAX_ITEM_UNITS})")
+        parsed.append((name, qty))
+    if not parsed:
+        raise ValueError("No valid (item, quantity) pairs found.")
+    return parsed
+# Base Format Layers
+
+
+
+
+
+# Base Class Layers
 class HistoryLeftButton(Button):
     def __init__(self):
         super().__init__(style=ButtonStyle.blurple, label="Previous", row=1)
@@ -99,7 +162,6 @@ class HistoryLeftButton(Button):
             self.view.index = len(self.view.history) - 1
         embed = format_history_embed(self.view)
         await interaction.response.edit_message(embed=embed)
-
 
 class HistoryRightButton(Button):
     def __init__(self):
@@ -113,7 +175,6 @@ class HistoryRightButton(Button):
         embed = format_history_embed(self.view)
         await interaction.response.edit_message(embed=embed)
 
-
 class HistoryToBalanceButton(Button):
     def __init__(self):
         super().__init__(style=ButtonStyle.grey, label="View Balance", row=2, emoji="💵")
@@ -123,7 +184,6 @@ class HistoryToBalanceButton(Button):
         balance_embed = format_balance_embed(self.view)
         await interaction.response.edit_message(embed=balance_embed, view=balance_view)
 
-
 class BalanceToHistoryButton(Button):
     def __init__(self):
         super().__init__(style=ButtonStyle.blurple, label="View History", row=1, emoji="📜")
@@ -132,7 +192,6 @@ class BalanceToHistoryButton(Button):
         history_view = BankHistoryViewer(self.view.index, self.view.balance, self.view.history, self.view.bank_owner)
         history_embed = format_history_embed(self.view)
         await interaction.response.edit_message(embed=history_embed, view=history_view)
-
 
 class BankHistoryViewer(View):
     def __init__(self, index, balance, history, bank_owner: Member):
@@ -147,7 +206,6 @@ class BankHistoryViewer(View):
         self.history = history
         self.bank_owner = bank_owner
 
-
 class BankBalanceViewer(View):
     def __init__(self, index, balance, history, bank_owner: Member):
         super().__init__()
@@ -158,7 +216,6 @@ class BankBalanceViewer(View):
         self.balance = balance
         self.history = history
         self.bank_owner = bank_owner
-
 
 def paginate_list(array: list, entries_per_page: int = None):
     if entries_per_page is None:
@@ -173,6 +230,11 @@ def paginate_list(array: list, entries_per_page: int = None):
     if ten_array:
         newer_array.append(ten_array)
     return newer_array
+# Base Class Layers
+
+
+
+
 
 # ============= "signup" Group of Commands =============
 @bot.slash_command(
@@ -181,9 +243,9 @@ def paginate_list(array: list, entries_per_page: int = None):
     force_global=True
 )
 async def signup_cmd(interaction: Interaction):
-    # group root; no direct execution
     pass
 
+# ============= Subcommand "join" of "signup"
 @signup_cmd.subcommand(
     name="join",
     description="Sign up and create your hint point inventory (0 pt).",
@@ -191,60 +253,91 @@ async def signup_cmd(interaction: Interaction):
 async def signup_join(
         interaction: Interaction,
         color_name: str = SlashOption(
-            description="Your color name (e.g., Crimson, Ocean Blue)",
-            required=True, max_length=32
+            description="Your color name (letters/spaces only, max 20)",
+            required=True, max_length=20  # enforce 20 at UI layer
         ),
         color_hex: str = SlashOption(
             description="Your color HEX (e.g., #FF0000 or FF0000)",
             required=True
         ),
 ):
+    # 1) Channel restriction (allow the channel or its thread)
+    ch = interaction.channel
+    in_allowed = (
+        interaction.channel_id == ALLOWED_SIGNUP_CHANNEL_ID
+        or getattr(ch, "parent_id", None) == ALLOWED_SIGNUP_CHANNEL_ID
+    )
+    if not in_allowed:
+        await interaction.response.send_message(
+            f"❌ You can only use this command in <#{ALLOWED_SIGNUP_CHANNEL_ID}>.",
+            ephemeral=True
+        )
+        return
+
     await interaction.response.defer()
 
-    # capacity check
+    # 2) Collections & capacity check
     players_db = db_client.players
     signups_col = players_db.signups
+    hp_db = db_client.hint_points
+    balance_col = hp_db.balance
+    portfolios = db_client.market.portfolios
+
     current_count = await signups_col.count_documents({})
     if current_count >= MAX_PLAYERS:
-        await interaction.followup.send(f"❌ Capacity full: {MAX_PLAYERS}/{MAX_PLAYERS}. Signups are closed.")
+        await interaction.followup.send(
+            f"❌ Capacity full: {MAX_PLAYERS}/{MAX_PLAYERS}. Signups are closed."
+        )
         return
 
     user_id = str(interaction.user.id)
 
-    # one-time signup per user
-    if await signups_col.find_one({"_id": user_id}) is not None:
+    # 3) If already in signups, reject (true duplicate)
+    existing_signup = await signups_col.find_one({"_id": user_id})
+    if existing_signup is not None:
         await interaction.followup.send("❌ You have already signed up. You can only sign up once.")
         return
 
-    # must not already have a bank
-    hp_db = db_client.hint_points
-    balance_col = hp_db.balance
-    if await balance_col.find_one({"_id": user_id}) is not None:
-        await interaction.followup.send("❌ You already have a hint point inventory. Signup is only for new players.")
+    # 4) Cleanup orphaned records BEFORE any “already have a bank” rejection.
+    #    If signups is missing but old hint bank / portfolio still exists, delete them.
+    existing_bank = await balance_col.find_one({"_id": user_id})
+    existing_port = await portfolios.find_one({"_id": user_id})
+    if existing_bank:
+        await balance_col.delete_one({"_id": user_id})
+    if existing_port:
+        await portfolios.delete_one({"_id": user_id})
+
+    # 5) Validate inputs
+    clean_name = color_name.strip()
+    if not COLOR_NAME_RE.fullmatch(clean_name):
+        await interaction.followup.send(
+            "❌ Invalid color name. Use only English letters and spaces, up to 20 characters."
+        )
         return
 
-    # hex validation
     norm_hex = _normalize_hex(color_hex)
     if norm_hex is None:
-        await interaction.followup.send("❌ Invalid HEX code. Provide a 6-digit HEX like `#RRGGBB`.")
+        await interaction.followup.send(
+            "❌ Invalid HEX code. Provide a 6-digit HEX like `#RRGGBB`."
+        )
         return
 
-    # record signup (user_id only on MongoDB, not seen)
+    # 6) Create signup record (user_id is stored but not displayed)
     await signups_col.insert_one({
         "_id": user_id,
         "user_id": user_id,
         "user_name": interaction.user.name,
-        "color_name": color_name.strip(),
+        "color_name": clean_name,
         "color_hex": norm_hex,
-        "signup_time": int(datetime.now().timestamp()),
+        "signup_time": _now_ts(),
     })
 
-    # create 0pt bank with history
+    # 7) Create 0pt hint bank with history
     await balance_col.insert_one({
         "_id": user_id,
         "balance": 0,
         "history": [{
-            "time": int(datetime.now().timestamp()),
+            "time": _now_ts(),
             "change": 0,
             "new_balance": 0,
             "user_id": str(bot.user.id),
@@ -252,24 +345,36 @@ async def signup_join(
         }],
     })
 
+    # 8) Create portfolio with starting cash and empty holdings
+    await portfolios.insert_one({
+        "_id": user_id,
+        "user_id": user_id,
+        "cash": STARTING_CASH,
+        "holdings": {code: 0 for code in ITEM_CODES},
+        "updated_at": _now_ts(),
+        "history": []
+    })
+
+    # 9) Acknowledge
     remaining = MAX_PLAYERS - (current_count + 1)
     embed = Embed(
         title="✅ Signup Complete",
         description=(
             f"**Player**: {interaction.user.mention}\n"
-            f"**Color**: {color_name} `{norm_hex}`\n"
+            f"**Color**: {clean_name} `{norm_hex}`\n"
             f"**Slots left until closing**: **{remaining}** / {MAX_PLAYERS}"
         ),
         colour=_colour_from_hex(norm_hex)
     )
     await interaction.followup.send(embed=embed)
 
+# ============= Subcommand "view" of "signup"
 @signup_cmd.subcommand(
     name="view",
     description="View the roster: [Username] - [Color Name] - [HEX]",
 )
 async def signup_view(interaction: Interaction):
-    # 실행 권한: OWNER만 (결과는 공개 메시지)
+    # Permission for OWNER_ID Only.
     if interaction.user.id != OWNER_ID:
         await interaction.response.defer(ephemeral=True)
         await interaction.followup.send("❌ Only the owner can run this command.")
@@ -291,6 +396,167 @@ async def signup_view(interaction: Interaction):
         colour=BOT_COLOUR
     )
     await interaction.followup.send(embed=embed)
+
+# ========= signup reset (interactive confirm) =========
+from nextcord.ui import View, Button
+from nextcord import ButtonStyle
+
+@signup_cmd.subcommand(
+    name="reset",
+    description="Owner-only: Set NEW items first, then wipe signups/hint banks/portfolios and apply."
+)
+async def signup_reset(
+        interaction: Interaction,
+        names: str = SlashOption(
+            description="8 names separated by | (letters/spaces only, 1~20 chars each)",
+            required=True
+        ),
+        prices: str = SlashOption(
+            description="8 integer prices separated by |",
+            required=True
+        ),
+        confirm: str = SlashOption(
+            description="Type CONFIRM to prepare the preview. Actual wipe happens after pressing the button.",
+            required=True
+        ),
+):
+    # 권한
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.defer(ephemeral=True)
+        await interaction.followup.send("❌ Only the owner can run this command.")
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    # 0) 1차 안전장치
+    if confirm != "CONFIRM":
+        await interaction.followup.send("❌ Type `CONFIRM` to prepare reset preview.")
+        return
+
+    # 1) 입력 파싱/검증
+    name_list = [s.strip() for s in names.split("|")]
+    price_list = [s.strip() for s in prices.split("|")]
+    if len(name_list) != 8 or len(price_list) != 8:
+        await interaction.followup.send("❌ Provide exactly 8 names and 8 prices, separated by `|`.")
+        return
+
+    NAME_RE = re.compile(r"^[A-Za-z ]{1,20}$")
+    for i, nm in enumerate(name_list):
+        if not NAME_RE.fullmatch(nm):
+            await interaction.followup.send(f"❌ Invalid name for {ITEM_CODES[i]}: `{nm}` (letters/spaces, 1~20).")
+            return
+
+    try:
+        price_vals = [int(x) for x in price_list]
+    except ValueError:
+        await interaction.followup.send("❌ Prices must be integers.")
+        return
+    if any(p <= 0 for p in price_vals):
+        await interaction.followup.send("❌ All prices must be positive integers.")
+        return
+
+    # 2) 미리보기 데이터 구성
+    new_items = {code: {"name": name_list[i], "price": price_vals[i]} for i, code in enumerate(ITEM_CODES)}
+    preview_lines = [f"{code}: **{new_items[code]['name']}** — {new_items[code]['price']}" for code in ITEM_CODES]
+    preview = "\n".join(preview_lines)
+
+    # 3) 확인용 View 정의
+    class ResetConfirmView(View):
+        def __init__(self, owner_id: int, items: dict):
+            super().__init__(timeout=600)
+            self.owner_id = owner_id
+            self.items = items
+            self.message = None
+
+        async def interaction_check(self, btn_inter: Interaction) -> bool:
+            # 오너만 버튼 클릭 가능
+            if btn_inter.user.id != self.owner_id:
+                await btn_inter.response.send_message("❌ Only the owner can confirm/cancel this.", ephemeral=True)
+                return False
+            return True
+
+        async def disable_all(self):
+            for c in self.children:
+                c.disabled = True
+            try:
+                await self.message.edit(view=self)
+            except:
+                pass
+
+    # Apply 버튼
+    class ApplyButton(Button):
+        def __init__(self):
+            super().__init__(style=ButtonStyle.danger, label="Apply & Wipe", emoji="🗑️")
+
+        async def callback(self, btn_inter: Interaction):
+            # 실제 삭제 + 신규 설정 저장
+            try:
+                # 1) 참여자/힌트/포트폴리오 삭제
+                sres = await db_client.players.signups.delete_many({})
+                bres = await db_client.hint_points.balance.delete_many({})
+                pres = await db_client.market.portfolios.delete_many({})
+
+                # 2) 품목 설정 교체
+                cfg_col = db_client.market.config
+                current = await cfg_col.find_one({"_id": "current"})
+                if current:
+                    await cfg_col.delete_one({"_id": "current"})
+                await cfg_col.insert_one({"_id": "current", "items": self.view.items, "updated_at": _now_ts()})
+
+                # 버튼 비활성 + 완료 메시지
+                await btn_inter.response.edit_message(
+                    embed=Embed(
+                        title="✅ Reset Applied",
+                        description=(
+                            "**Wiped collections**\n"
+                            f"- Deleted signups: {sres.deleted_count}\n"
+                            f"- Deleted hint banks: {bres.deleted_count}\n"
+                            f"- Deleted portfolios: {pres.deleted_count}\n\n"
+                            "**New Items (A~H)**\n" + 
+                            "\n".join([f"{c}: **{self.view.items[c]['name']}** — {self.view.items[c]['price']}" for c in ITEM_CODES])
+                        ),
+                        colour=BOT_COLOUR
+                    ),
+                    view=None
+                )
+            except Exception as e:
+                await btn_inter.response.edit_message(
+                    content=f"❌ Error during reset: {e}",
+                    view=None
+                )
+
+    # Cancel 버튼
+    class CancelButton(Button):
+        def __init__(self):
+            super().__init__(style=ButtonStyle.secondary, label="Cancel", emoji="🚫")
+
+        async def callback(self, btn_inter: Interaction):
+            await btn_inter.response.edit_message(
+                embed=Embed(
+                    title="❎ Reset Cancelled",
+                    description="No data was deleted or changed.",
+                    colour=BOT_COLOUR
+                ),
+                view=None
+            )
+
+    view = ResetConfirmView(OWNER_ID, new_items)
+    view.add_item(ApplyButton())
+    view.add_item(CancelButton())
+
+    embed = Embed(
+        title="⚠️ Reset Preview",
+        description=(
+            "If you press **Apply & Wipe**, the bot will:\n"
+            "1) Delete **signups**, **hint point inventories**, and **portfolios**.\n"
+            "2) Replace **market items** with the following A~H config.\n\n"
+            "**New Items (A~H) Preview**\n" + preview
+        ),
+        colour=BOT_COLOUR
+    )
+
+    msg = await interaction.followup.send(embed=embed, view=view)
+    view.message = msg
 
 
 
@@ -539,32 +805,6 @@ async def transfer(
         allowed_mentions=AllowedMentions(everyone=False, roles=False, users=[user]),
     )
 
-# ============= Subcommand "reset" of "hint_points"
-@hint_points_cmd.subcommand(
-    description="Resets all hint point and stock change info. Be careful with this command!",
-)
-async def reset(
-        interaction: Interaction,
-        confirm: str = SlashOption(
-            description="put CONFIRM in this to proceed.",
-            required=True,
-        ),
-):
-    await interaction.response.defer()
-    if not interaction.user.id == OWNER_ID:
-        await interaction.followup.send("You are not Lunarisk. You cannot reset hint points. Go away.")
-        return
-    if not confirm == "CONFIRM":
-        await interaction.followup.send("Command rejected. Put ``CONFIRM`` in the ``confirm`` option to reset all hint point and stock change info.")
-        return
-    db = db_client.hint_points
-    collection = db.balance
-    await collection.delete_many({})
-    db = db_client.stocks
-    collection = db.changes
-    await collection.delete_many({})
-    await interaction.followup.send("Successfully reset hint point and stock change info. Hopefully you didn't do this on accident!")
-
 # ============= Subcommand "list" of "hint_points"
 @hint_points_cmd.subcommand(
     name="list",
@@ -594,13 +834,15 @@ async def hint_points_list(
 
 
 
+
+# ============= "trade" Group of Commands =============
+# ============= "stock" Group of Commands =============
 @bot.slash_command(
     name="stock_change",
     description="Set stock changes, for giving out hints.",
     force_global=True)
 async def stock_change_cmd(interaction: Interaction):
     pass
-
 
 @stock_change_cmd.subcommand(
     name="set",
@@ -641,7 +883,6 @@ async def stock_change_set(
     await collection.insert_one(new_change)
     await interaction.followup.send(f"Successfully recorded stock changes for year {year}" + msg)
 
-
 async def year_autocomplete(interaction: Interaction, year: str):
     db = db_client.stocks
     collection = db.changes
@@ -651,7 +892,6 @@ async def year_autocomplete(interaction: Interaction, year: str):
     autocomplete_years = [row["_id"] for row in years]
     await interaction.response.send_autocomplete(autocomplete_years)
     return
-
 
 @stock_change_cmd.subcommand(
     name="view",
@@ -681,7 +921,6 @@ async def stock_change_view(
             continue
         msg += f"{stock}: {'+' if change > 0 else ''}{change}%\n"
     await interaction.followup.send(f"# Year {year} changes\n\n" + msg)
-
 
 @stock_change_cmd.subcommand(
     name="odds",
@@ -723,14 +962,12 @@ async def stock_change_odds(
         msg,
     )
 
-
 @bot.slash_command(
     name="use_hint",
     description="Use your hint points",
     force_global=True)
 async def use_hint(interaction: Interaction):
     pass
-
 
 def calculate_odds(years: list):
     print(years)
@@ -745,7 +982,6 @@ def calculate_odds(years: list):
             stock_odds[stock] += ODDS[change]
             stock_odds[stock] = max(min(stock_odds[stock], 100), 0)
     return stock_odds
-
 
 @use_hint.subcommand(
     name="r",
@@ -821,7 +1057,6 @@ async def r_hint(
             view=balance_view,
         )
         return
-
 
 @use_hint.subcommand(
     name="lvl1",
@@ -908,7 +1143,6 @@ async def lvl1_hint(
             view=balance_view,
         )
         return
-
 
 @use_hint.subcommand(
     name="lvl2",
@@ -998,7 +1232,6 @@ async def lvl2_hint(
         )
         return
 
-
 @use_hint.subcommand(
     name="lvl3",
     description="Shows whether a stock will increase or decrease. Costs 3 HP",
@@ -1084,7 +1317,6 @@ async def lvl3_hint(
         )
         return
 
-
 @bot.message_command(name="Get Unix timestamp")
 async def command_rac_time(interaction: Interaction, sent_message: Message):
     await interaction.response.defer()
@@ -1092,6 +1324,5 @@ async def command_rac_time(interaction: Interaction, sent_message: Message):
     time_message = f"Message link: {sent_message.jump_url}\nUnix timestamp: {unix_timestamp}\n<t:{unix_timestamp}:f>" \
                    f"\n<t:{unix_timestamp}:R>"
     await interaction.followup.send(time_message)
-
 
 bot.run(os.getenv("BOT_TOKEN"))

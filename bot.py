@@ -835,7 +835,309 @@ async def hint_points_list(
 
 
 
-# ============= "trade" Group of Commands =============
+
+# ============= "market" Group of Commands =============
+@bot.slash_command(
+    name="market",
+    description="Market info & trading (view, purchase, sell, portfolio)",
+    force_global=True
+)
+async def market_cmd(interaction: Interaction):
+    # group root; no direct execution
+    pass
+
+# ---------- Helpers for portfolio math ----------
+def _portfolio_totals(items_cfg: dict, portfolio: dict) -> tuple[int, int]:
+    """Return (unspent_cash, total_cash) where total = cash + sum(qty * price)."""
+    cash = int(portfolio.get("cash", 0))
+    holdings = portfolio.get("holdings", {})
+    valuation = 0
+    for code in ITEM_CODES:
+        q = int(holdings.get(code, 0))
+        if q <= 0:
+            continue
+        price = int(items_cfg[code]["price"])
+        valuation += q * price
+    return cash, cash + valuation
+
+# ---------- Public: see configurable items ----------
+@market_cmd.subcommand(
+    name="view",
+    description="View current stock items (A–H) and prices."
+)
+async def market_view(interaction: Interaction):
+    """Public: show item codes A–H with their configured names & prices."""
+    await interaction.response.defer()  # public reply
+
+    cfg = await _get_market_config()
+    if not cfg or "items" not in cfg:
+        await interaction.followup.send("❌ Market is not configured yet.")
+        return
+
+    items = cfg["items"]
+    lines = []
+    for code in ITEM_CODES:
+        info = items.get(code)
+        if not info:
+            lines.append(f"{code}: _(not set)_")
+            continue
+        nm = info.get("name", "(unnamed)")
+        pr = info.get("price", "?")
+        lines.append(f"{code}: **{nm}** — {pr}")
+
+    await interaction.followup.send(
+        embed=Embed(
+            title="Market Items (A–H)",
+            description="\n".join(lines),
+            colour=BOT_COLOUR
+        )
+    )
+
+# ---------- Personal portfolio (ephemeral) ----------
+@market_cmd.subcommand(
+    name="portfolio",
+    description="View your portfolio: Unspent Cash, Total Cash, and your holdings."
+)
+async def market_portfolio(interaction: Interaction):
+    """Ephemeral: user sees their own cash, total, and non-zero holdings."""
+    await interaction.response.defer(ephemeral=True)
+
+    cfg = await _get_market_config()
+    if not cfg or "items" not in cfg:
+        await interaction.followup.send("❌ Market is not configured yet.")
+        return
+    items = cfg["items"]
+
+    uid = str(interaction.user.id)
+    pf = await db_client.market.portfolios.find_one({"_id": uid})
+    if not pf:
+        await interaction.followup.send("❌ No portfolio. Use **/signup join** first.")
+        return
+
+    holdings_lines = []
+    for code in ITEM_CODES:
+        qty = int(pf["holdings"].get(code, 0))
+        if qty > 0:
+            value = qty * int(items[code]["price"])
+            holdings_lines.append(f"{code} - {items[code]['name']}: {qty} (≈ {value})")
+
+    unspent, total = _portfolio_totals(items, pf)
+    desc = (
+        f"**Unspent Cash**: {unspent}\n"
+        f"**Total Cash**: {total}\n\n" +
+        ("**Holdings**\n" + "\n".join(holdings_lines) if holdings_lines else "_No holdings_")
+    )
+    await interaction.followup.send(embed=Embed(
+        title=f"Portfolio — {interaction.user.display_name}",
+        description=desc,
+        colour=BOT_COLOUR
+    ))
+
+# ---------- Owner-only: inspect someone else’s portfolio ----------
+@market_cmd.subcommand(
+    name="admin_view",
+    description="OWNER: View someone else's portfolio."
+)
+async def market_admin_view(
+    interaction: Interaction,
+    user: Member = SlashOption(description="User to view", required=True)
+):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.defer(ephemeral=True)
+        await interaction.followup.send("❌ Only the owner can run this command.")
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    cfg = await _get_market_config()
+    if not cfg or "items" not in cfg:
+        await interaction.followup.send("❌ Market is not configured yet.")
+        return
+    items = cfg["items"]
+
+    uid = str(user.id)
+    pf = await db_client.market.portfolios.find_one({"_id": uid})
+    if not pf:
+        await interaction.followup.send("❌ No portfolio for that user.")
+        return
+
+    holdings_lines = []
+    for code in ITEM_CODES:
+        qty = int(pf["holdings"].get(code, 0))
+        if qty > 0:
+            value = qty * int(items[code]["price"])
+            holdings_lines.append(f"{code} - {items[code]['name']}: {qty} (≈ {value})")
+
+    unspent, total = _portfolio_totals(items, pf)
+    desc = (
+        f"**Unspent Cash**: {unspent}\n"
+        f"**Total Cash**: {total}\n\n" +
+        ("**Holdings**\n" + "\n".join(holdings_lines) if holdings_lines else "_No holdings_")
+    )
+    await interaction.followup.send(embed=Embed(
+        title=f"Portfolio — {user.display_name}",
+        description=desc,
+        colour=BOT_COLOUR
+    ))
+
+# ---------- Purchase: spend Unspent Cash to increase holdings ----------
+@market_cmd.subcommand(
+    name="purchase",
+    description="Buy items. Multiple pairs allowed (e.g., 'A 10, Apple 3')."
+)
+async def market_purchase(
+    interaction: Interaction,
+    orders: str = SlashOption(
+        description="Pairs like 'A 10, C 5' or names 'Apple 3' (comma/|/;/newline separated).",
+        required=True
+    ),
+):
+    """Ephemeral: parse pairs; ensure no debt; enforce per-item cap; update portfolio."""
+    await interaction.response.defer(ephemeral=True)
+
+    cfg = await _get_market_config()
+    if not cfg or "items" not in cfg:
+        await interaction.followup.send("❌ Market is not configured yet.")
+        return
+    items = cfg["items"]
+
+    uid = str(interaction.user.id)
+    pf_col = db_client.market.portfolios
+    pf = await pf_col.find_one({"_id": uid})
+    if not pf:
+        await interaction.followup.send("❌ No portfolio. Use **/signup join** first.")
+        return
+
+    # Parse "(item, qty)" pairs
+    try:
+        pairs = _parse_orders(orders)
+    except ValueError as e:
+        await interaction.followup.send(f"❌ {e}")
+        return
+
+    # Pre-calc total cost and per-item limit
+    add_map: dict[str, int] = {}
+    total_cost = 0
+    for ident, qty in pairs:
+        code = _resolve_item_code(items, ident)
+        if not code:
+            await interaction.followup.send(f"❌ Unknown item: `{ident}`")
+            return
+        price = int(items[code]["price"])
+        cur_qty = int(pf["holdings"].get(code, 0))
+        if cur_qty + qty > MAX_ITEM_UNITS:
+            await interaction.followup.send(f"❌ Holding limit exceeded for {code}. Max {MAX_ITEM_UNITS}.")
+            return
+        add_map[code] = add_map.get(code, 0) + qty
+        total_cost += price * qty
+
+    # Debt check: Unspent Cash must stay >= 0 after purchase
+    if pf["cash"] - total_cost < 0:
+        await interaction.followup.send(
+            f"❌ Not enough cash. Need {total_cost}, you have {pf['cash']} (debt not allowed)."
+        )
+        return
+
+    # Apply updates
+    for code, qty in add_map.items():
+        pf["holdings"][code] = int(pf["holdings"].get(code, 0)) + qty
+    pf["cash"] -= total_cost
+    await pf_col.update_one(
+        {"_id": uid},
+        {"$set": {"holdings": pf["holdings"], "cash": pf["cash"], "updated_at": _now_ts()}}
+    )
+
+    # Reply summary
+    lines = [f"{code} ({items[code]['name']}): +{qty} @ {items[code]['price']}"
+             for code, qty in add_map.items()]
+    unspent, total = _portfolio_totals(items, pf)
+    await interaction.followup.send(
+        "✅ Purchase complete:\n- " + "\n- ".join(lines) +
+        f"\n**Unspent Cash**: {unspent}\n**Total Cash**: {total}"
+    )
+
+# ---------- Sell: convert holdings back to Unspent Cash ----------
+@market_cmd.subcommand(
+    name="sell",
+    description="Sell items. Multiple pairs allowed; partial sell allowed."
+)
+async def market_sell(
+    interaction: Interaction,
+    orders: str = SlashOption(
+        description="Pairs like 'A 10, C 5' or names 'Apple 3' (comma/|/;/newline separated).",
+        required=True
+    ),
+):
+    """Ephemeral: sell up to held quantity; refund goes into Unspent Cash."""
+    await interaction.response.defer(ephemeral=True)
+
+    cfg = await _get_market_config()
+    if not cfg or "items" not in cfg:
+        await interaction.followup.send("❌ Market is not configured yet.")
+        return
+    items = cfg["items"]
+
+    uid = str(interaction.user.id)
+    pf_col = db_client.market.portfolios
+    pf = await pf_col.find_one({"_id": uid})
+    if not pf:
+        await interaction.followup.send("❌ No portfolio. Use **/signup join** first.")
+        return
+
+    # Parse "(item, qty)" pairs
+    try:
+        pairs = _parse_orders(orders)
+    except ValueError as e:
+        await interaction.followup.send(f"❌ {e}")
+        return
+
+    sold_lines = []
+    total_gain = 0
+    any_success = False
+
+    for ident, req_qty in pairs:
+        code = _resolve_item_code(items, ident)
+        if not code:
+            sold_lines.append(f"❌ Unknown item: `{ident}` — skipped")
+            continue
+
+        have = int(pf["holdings"].get(code, 0))
+        if have <= 0:
+            sold_lines.append(f"❌ {code} ({items[code]['name']}): you have 0 — rejected")
+            continue
+
+        # Partial sell allowed: sell as much as the user has
+        sell_qty = min(have, req_qty)
+        gain = sell_qty * int(items[code]["price"])
+
+        pf["holdings"][code] = have - sell_qty
+        pf["cash"] += gain
+        total_gain += gain
+        any_success = True
+
+        if sell_qty < req_qty:
+            sold_lines.append(
+                f"⚠️ {code} ({items[code]['name']}): requested {req_qty}, sold {sell_qty} (all you had) @ {items[code]['price']}"
+            )
+        else:
+            sold_lines.append(f"✅ {code} ({items[code]['name']}): -{sell_qty} @ {items[code]['price']}")
+
+    if any_success:
+        await pf_col.update_one(
+            {"_id": uid},
+            {"$set": {"holdings": pf["holdings"], "cash": pf["cash"], "updated_at": _now_ts()}}
+        )
+
+    unspent, total = _portfolio_totals(items, pf)
+    summary = "\n- ".join(sold_lines) if sold_lines else "(nothing parsed)"
+    await interaction.followup.send(
+        f"{summary}\n\n**Unspent Cash**: {unspent} (+{total_gain})\n**Total Cash**: {total}"
+    )
+
+
+
+
+
 # ============= "stock" Group of Commands =============
 @bot.slash_command(
     name="stock_change",
@@ -962,6 +1264,11 @@ async def stock_change_odds(
         msg,
     )
 
+
+
+
+
+# Hint Point System
 @bot.slash_command(
     name="use_hint",
     description="Use your hint points",

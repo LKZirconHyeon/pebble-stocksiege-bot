@@ -99,6 +99,25 @@ def _now_ts() -> int:
 async def _get_market_config():
     return await db_client.market.config.find_one({"_id": "current"})  # {"items":{A:{name,price},...}}
 
+async def _use_next_prices_flag() -> bool:
+    """Toggle set by /stock_change reveal_next. When True, portfolios value at next_price."""
+    cfg = await db_client.market.config.find_one({"_id": "current"}, {"use_next_for_total": 1})
+    return bool(cfg and cfg.get("use_next_for_total"))
+
+def _portfolio_totals_with_mode(items_cfg: dict, portfolio: dict, use_next: bool) -> tuple[int, int]:
+    """Return (unspent_cash, total_cash) where total = cash + sum(qty * price_mode)."""
+    cash = int(portfolio.get("cash", 0))
+    holdings = portfolio.get("holdings", {})
+    total_val = 0
+    for code in ITEM_CODES:
+        q = int(holdings.get(code, 0))
+        if q <= 0 or code not in items_cfg:
+            continue
+        base = int(items_cfg[code]["price"])
+        price = int(items_cfg[code].get("next_price", base)) if use_next else base
+        total_val += q * price
+    return cash, cash + total_val
+
 def _resolve_item_code(cfg_items: dict, ident: str) -> str | None:
     """
     ident: 'A'~'H' or configured name (case-insensitive).
@@ -144,6 +163,41 @@ def _parse_orders(orders_raw: str) -> list[tuple[str, int]]:
     if not parsed:
         raise ValueError("No valid (item, quantity) pairs found.")
     return parsed
+
+# Build a safe mention string for "/signup join"
+def signup_join_mention() -> str:
+    try:
+        return signup_join.get_mention(guild=None)
+    except Exception:
+        return "/signup join"
+    
+NO_BANK_MSG_SELF = (
+    "You don’t have a Hint Point Inventory (you haven’t signed up yet).\n\n"
+    f"Please run {signup_join_mention()} to sign up and create one (0 pt)."
+)
+
+def no_bank_msg_for(user_mention: str) -> str:
+    return (
+        f"{user_mention} does not have a Hint Point Inventory (they haven’t signed up yet).\n\n"
+        f"If you are the host, please instruct them to run {signup_join_mention()}."
+    )
+
+def _item_label(code: str, items_cfg: dict | None) -> str:
+    """Return 'A — Apple' if a name exists, otherwise 'A'."""
+    info = (items_cfg or {}).get(code) or {}
+    nm = info.get("name")
+    return f"{code} — {nm}" if nm else code
+
+def _signup_needed_msg_self() -> str:
+    """Standard guidance when a user has no hint bank (not signed up)."""
+    try:
+        mention = signup_join.get_mention(guild=None)
+    except Exception:
+        mention = "/signup join"
+    return (
+        "You don’t have a Hint Point Inventory (you haven’t signed up yet).\n\n"
+        f"Please run {mention} to sign up and create one (0 pt)."
+    )
 # Base Format Layers
 
 
@@ -598,8 +652,7 @@ async def add(
     collection = db.balance
     bank = await collection.find_one({"_id": str(user.id)})
     if bank is None:
-        await interaction.followup.send(f"{user.mention} has not set up their hint points yet.\n\n"
-                                        f"To set up hint points, use the {bank_setup.get_mention(guild=None)} command.")
+        await interaction.followup.send(no_bank_msg_for(user.mention))
         return
     else:
         balance = bank["balance"]
@@ -656,8 +709,7 @@ async def remove(
     collection = db.balance
     bank = await collection.find_one({"_id": str(user.id)})
     if bank is None:
-        await interaction.followup.send(f"{user.mention} has not set up their hint points yet.\n\n"
-                                        f"To set up hint points, use the {bank_setup.get_mention(guild=None)} command.")
+        await interaction.followup.send(no_bank_msg_for(user.mention))
         return
     balance = bank["balance"]
     if balance - hint_points < 0:
@@ -713,8 +765,7 @@ async def hint_points_view(
     collection = db.balance
     existing_bank = await collection.find_one({"_id": str(user.id)})
     if existing_bank is None:
-        await interaction.followup.send(f"{user.mention} has not set up their hint points yet.\n\n"
-                                        f"To set up hint points, use the {bank_setup.get_mention(guild=None)} command.")
+        await interaction.followup.send(no_bank_msg_for(user.mention))
         return
     existing_bank["history"].sort(key=lambda x: x["time"], reverse=True)
     history = paginate_list(existing_bank["history"])
@@ -754,12 +805,10 @@ async def transfer(
     send_bank = await collection.find_one({"_id": str(interaction.user.id)})
     receive_bank = await collection.find_one({"_id": str(user.id)})
     if send_bank is None:
-        await interaction.followup.send(f"You have not set up your hint points yet.\n\n"
-                                        f"To set up hint points, use the {bank_setup.get_mention(guild=None)} command.")
+        await interaction.followup.send(no_bank_msg_for(user.mention))
         return
     if receive_bank is None:
-        await interaction.followup.send(f"{user.mention} has not set up their hint points yet.\n\n"
-                                        f"To set up hint points, use the {bank_setup.get_mention(guild=None)} command.")
+        await interaction.followup.send(no_bank_msg_for(user.mention))
         return
     transaction_time = int(datetime.now().timestamp())
     send_balance = send_bank["balance"]
@@ -899,7 +948,6 @@ async def market_view(interaction: Interaction):
     description="View your portfolio: Unspent Cash, Total Cash, and your holdings."
 )
 async def market_portfolio(interaction: Interaction):
-    """Ephemeral: user sees their own cash, total, and non-zero holdings."""
     await interaction.response.defer(ephemeral=True)
 
     cfg = await _get_market_config()
@@ -914,15 +962,22 @@ async def market_portfolio(interaction: Interaction):
         await interaction.followup.send("❌ No portfolio. Use **/signup join** first.")
         return
 
+    use_next = await _use_next_prices_flag()
+
     holdings_lines = []
     for code in ITEM_CODES:
         qty = int(pf["holdings"].get(code, 0))
         if qty > 0:
-            value = qty * int(items[code]["price"])
-            holdings_lines.append(f"{code} - {items[code]['name']}: {qty} (≈ {value})")
+            base = int(items[code]["price"])
+            p = int(items[code].get("next_price", base)) if use_next else base
+            value = qty * p
+            name = items[code]["name"]
+            holdings_lines.append(f"{code} - {name}: {qty} (≈ {value})")
 
-    unspent, total = _portfolio_totals(items, pf)
+    unspent, total = _portfolio_totals_with_mode(items, pf, use_next)
+    mode_label = "NEXT-year prices" if use_next else "current prices"
     desc = (
+        f"_Valuation uses {mode_label}_\n\n"
         f"**Unspent Cash**: {unspent}\n"
         f"**Total Cash**: {total}\n\n" +
         ("**Holdings**\n" + "\n".join(holdings_lines) if holdings_lines else "_No holdings_")
@@ -961,15 +1016,22 @@ async def market_admin_view(
         await interaction.followup.send("❌ No portfolio for that user.")
         return
 
+    use_next = await _use_next_prices_flag()
+
     holdings_lines = []
     for code in ITEM_CODES:
         qty = int(pf["holdings"].get(code, 0))
         if qty > 0:
-            value = qty * int(items[code]["price"])
-            holdings_lines.append(f"{code} - {items[code]['name']}: {qty} (≈ {value})")
+            base = int(items[code]["price"])
+            p = int(items[code].get("next_price", base)) if use_next else base
+            value = qty * p
+            name = items[code]["name"]
+            holdings_lines.append(f"{code} - {name}: {qty} (≈ {value})")
 
-    unspent, total = _portfolio_totals(items, pf)
+    unspent, total = _portfolio_totals_with_mode(items, pf, use_next)
+    mode_label = "NEXT-year prices" if use_next else "current prices"
     desc = (
+        f"_Valuation uses {mode_label}_\n\n"
         f"**Unspent Cash**: {unspent}\n"
         f"**Total Cash**: {total}\n\n" +
         ("**Holdings**\n" + "\n".join(holdings_lines) if holdings_lines else "_No holdings_")
@@ -1138,131 +1200,243 @@ async def market_sell(
 
 
 
-# ============= "stock" Group of Commands =============
+# ============= "stock_change" Group of Commands (modernized) =============
 @bot.slash_command(
     name="stock_change",
-    description="Set stock changes, for giving out hints.",
-    force_global=True)
+    description="Owner: manage yearly stock % changes and reveal next-year projection",
+    force_global=True
+)
 async def stock_change_cmd(interaction: Interaction):
+    # group root; no direct execution
     pass
 
+# ---------- Utilities ----------
+async def _get_changes_for_year(year: int) -> dict | None:
+    """Return {A..H: percent} for a year from db.stocks.changes, or None."""
+    doc = await db_client.stocks.changes.find_one({"_id": year})
+    if not doc:
+        return None
+    return {k: int(v) for k, v in doc.items() if k in ITEM_CODES}
+
+def _price_with_change(base_price: int, percent: int) -> int:
+    """100% => 2x; -50% => 0.5x; round to int; never negative."""
+    return max(0, int(round(base_price * (1.0 + percent / 100.0))))
+
+# ---------- /stock_change set ----------
 @stock_change_cmd.subcommand(
     name="set",
-    description="Set stock changes, for giving out hints.",
+    description="Owner: set 8 % changes (A–H) for a year. Example: -10 5 0 40 -20 0 10 15"
 )
 async def stock_change_set(
-        interaction: Interaction,
-        changes: str = SlashOption(
-            description="Put each change in here, separated by a space.",
-            required=True,
-        ),
-        year: int = SlashOption(
-            description="The year the changes occurred.",
-            required=True,
-        ),
+    interaction: Interaction,
+    changes: str = SlashOption(
+        description="8 integers separated by a space (e.g., -10 5 0 40 -20 0 10 15)",
+        required=True,
+    ),
+    year: int = SlashOption(
+        description="Year the changes apply to",
+        required=True,
+    ),
 ):
     await interaction.response.defer(ephemeral=True)
-    if not interaction.user.id == OWNER_ID:
-        await interaction.followup.send("You are not Lunarisk. You cannot reset hint points. Go away.")
+    if interaction.user.id != OWNER_ID:
+        await interaction.followup.send("❌ Owner only.")
         return
-    changes = changes.split()
-    if not len(changes) == 8:
-        await interaction.followup.send("This bot only works with 8 stocks. Contact bohaska to code stuff if you're working with more than that.")
-        return
-    if any(int(change) not in NORMAL_STOCK_CHANGES for change in changes):
-        await interaction.followup.send("Some of the changes you input are invalid changes.")
-        return
-    db = db_client.stocks
-    collection = db.changes
-    capitalized_letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    new_change = {capitalized_letters[index]: int(changes[index]) for index in range(0, len(changes))}
-    existing_change = await collection.find_one({"_id": year})
-    msg = ""
-    if existing_change is not None:
-        await collection.delete_one({"_id": year})
-        msg = "\nNote: The year you input was found in the database, so it was replaced with your new changes."
-    new_change["_id"] = year
-    await collection.insert_one(new_change)
-    await interaction.followup.send(f"Successfully recorded stock changes for year {year}" + msg)
 
+    # Parse "space-separated" values (keep compatibility with your old UX)
+    parts = [p.strip() for p in changes.split()]
+    if len(parts) != 8:
+        await interaction.followup.send("❌ Provide exactly 8 changes separated by spaces.")
+        return
+
+    try:
+        vals = [int(x) for x in parts]
+    except ValueError:
+        await interaction.followup.send("❌ All changes must be integers (e.g., -10, 0, 25).")
+        return
+
+    # Validate against your NORMAL_STOCK_CHANGES domain
+    if any(v not in NORMAL_STOCK_CHANGES for v in vals):
+        await interaction.followup.send("❌ Some changes are not in the allowed set.")
+        return
+
+    payload = {"_id": year}
+    for i, code in enumerate(ITEM_CODES):
+        payload[code] = vals[i]
+
+    col = db_client.stocks.changes
+    existed = await col.find_one({"_id": year}) is not None
+    if existed:
+        await col.delete_one({"_id": year})
+    await col.insert_one(payload)
+
+    preview = ", ".join([f"{ITEM_CODES[i]}:{vals[i]}%" for i in range(8)])
+    note = "\nNote: Replaced existing year." if existed else ""
+    await interaction.followup.send(f"✅ Recorded stock changes for **{year}** → {preview}{note}")
+
+# ---------- year autocomplete (unchanged behavior) ----------
 async def year_autocomplete(interaction: Interaction, year: str):
-    db = db_client.stocks
-    collection = db.changes
     years = []
-    async for entry in collection.find({}, ["_id"]):
-        years.append(entry)
-    autocomplete_years = [row["_id"] for row in years]
-    await interaction.response.send_autocomplete(autocomplete_years)
+    async for entry in db_client.stocks.changes.find({}, ["_id"]):
+        years.append(entry["_id"])
+    # Return as strings to be safe with autocomplete
+    await interaction.response.send_autocomplete([str(x) for x in sorted(years)])
     return
 
+# ---------- /stock_change view ----------
 @stock_change_cmd.subcommand(
     name="view",
-    description="View stock changes you set for a year.",
+    description="Owner: view stock changes for a year.",
 )
 async def stock_change_view(
-        interaction: Interaction,
-        year: int = SlashOption(
-            description="The year you want to view.",
-            required=True,
-            autocomplete_callback=year_autocomplete
-        ),
+    interaction: Interaction,
+    year: int = SlashOption(
+        description="Year to view",
+        required=True,
+        autocomplete_callback=year_autocomplete
+    ),
 ):
     await interaction.response.defer(ephemeral=True)
-    if not interaction.user.id == OWNER_ID:
-        await interaction.followup.send("You are not Lunarisk. You cannot view stock changes. Go away.")
+    if interaction.user.id != OWNER_ID:
+        await interaction.followup.send("❌ Owner only.")
         return
-    db = db_client.stocks
-    collection = db.changes
-    existing_change = await collection.find_one({"_id": year})
-    if existing_change is None:
-        await interaction.followup.send("This year doesn't exist in the database.")
-        return
-    msg = ""
-    for stock, change in existing_change.items():
-        if stock == "_id":
-            continue
-        msg += f"{stock}: {'+' if change > 0 else ''}{change}%\n"
-    await interaction.followup.send(f"# Year {year} changes\n\n" + msg)
 
+    changes_doc = await _get_changes_for_year(year)
+    if not changes_doc:
+        await interaction.followup.send("❌ This year doesn't exist in the database.")
+        return
+
+    # Pull current market item names; fall back gracefully if not configured
+    cfg = await _get_market_config()
+    items_cfg = (cfg or {}).get("items", {})
+
+    # Show 'A — Apple: +10%' style lines
+    lines = [
+        f"{_item_label(code, items_cfg)}: {'+' if changes_doc[code] > 0 else ''}{changes_doc[code]}%"
+        for code in ITEM_CODES
+    ]
+
+    await interaction.followup.send(
+        embed=Embed(
+            title=f"Year {year} — Changes",
+            description="\n".join(lines),
+            colour=BOT_COLOUR
+        )
+    )
+
+
+# ---------- /stock_change odds (kept; modernized message) ----------
 @stock_change_cmd.subcommand(
     name="odds",
-    description="View stock odds. Owner-only.",
+    description="Owner: compute odds from historical changes."
 )
-async def stock_change_odds(
-        interaction: Interaction,
+async def stock_change_odds(interaction: Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if interaction.user.id != OWNER_ID:
+        await interaction.followup.send("❌ Owner only.")
+        return
+
+    years = [doc async for doc in db_client.stocks.changes.find({})]
+    if not years:
+        await interaction.followup.send(
+            "There is no stock info in the database.\n"
+            "Either you did not set changes, or this is the start of a season (all 50%)."
+        )
+        return
+
+    years.sort(key=lambda d: d["_id"])
+    r_years = years[:-1]  # R-hint excludes latest year
+
+    items_cfg = (await _get_market_config() or {}).get("items", {})
+
+    r_odds_info = ""
+    if r_years:
+        r_odds = calculate_odds(r_years)
+        r_odds_info = "R-hint (excludes latest year changes)\n\n" + "\n".join(
+            f"{_item_label(k, items_cfg)}: {v}%"
+            for k, v in r_odds.items()
+        )
+
+    owner_odds = calculate_odds(years)
+    owner_odds_info = "Owner odds (includes latest year)\n\n" + "\n".join(
+        f"{_item_label(k, items_cfg)}: {v}%"
+        for k, v in owner_odds.items()
+    )
+
+    await interaction.followup.send((r_odds_info + ("\n\n" if r_odds_info else "") + owner_odds_info) or "No data.")
+
+# ---------- /stock_change reveal_next ----------
+@stock_change_cmd.subcommand(
+    name="reveal_next",
+    description="Owner: project next-year prices from a set year and switch portfolio totals to NEXT."
+)
+async def stock_change_reveal_next(
+    interaction: Interaction,
+    year: int = SlashOption(description="Year to project", required=True),
+    confirm: str = SlashOption(description="Type CONFIRM to proceed.", required=True),
 ):
     await interaction.response.defer(ephemeral=True)
-    if not interaction.user.id == OWNER_ID:
-        await interaction.followup.send("You are not Lunarisk. You cannot view stock odds. Go away.")
+    if interaction.user.id != OWNER_ID:
+        await interaction.followup.send("❌ Owner only.")
         return
-    db = db_client.stocks
-    collection = db.changes
-    years = []
-    async for year in collection.find({}):
-        years.append(year)
-    print(years)
-    years.sort(key=lambda year: year['_id'])
-    r_years = years[:-1]
-    if not years:
-        await interaction.followup.send("There is no stock info in this bot's database.\n"
-                                        "Either you did not update stock info,"
-                                        " or this is the start of a season (All stocks 50%).")
+    if confirm != "CONFIRM":
+        await interaction.followup.send("❌ Type `CONFIRM` to proceed.")
         return
-    r_odds = calculate_odds(r_years)
-    if r_years:
-        r_odd_info = "R-hint (Does not include latest year changes)\n\n"
-        for stock, odd in r_odds.items():
-            r_odd_info += f"{stock}: {odd}%\n"
-    else:
-        r_odd_info = ""
-    owner_odds = calculate_odds(years)
-    owner_odds_info = "Owner-only odds (Includes latest year changes)\n\n"
-    for stock, odd in owner_odds.items():
-        owner_odds_info += f"{stock}: {odd}%\n"
-    msg = r_odd_info + "\n\n" + owner_odds_info
-    await interaction.followup.send(
-        msg,
+
+    # Require changes for the chosen year
+    ch = await _get_changes_for_year(year)
+    if not ch:
+        await interaction.followup.send(f"❌ No changes found for {year}. Set them first with /stock_change set.")
+        return
+
+    # Load current items and compute next_price for each A..H
+    cfg_col = db_client.market.config
+    cfg = await cfg_col.find_one({"_id": "current"})
+    if not cfg or "items" not in cfg:
+        await interaction.followup.send("❌ Market is not configured.")
+        return
+
+    items = cfg["items"]
+    for code in ITEM_CODES:
+        base_price = int(items[code]["price"])
+        pct = int(ch.get(code, 0))
+        items[code]["next_price"] = _price_with_change(base_price, pct)
+
+    # Flip the flag so portfolio totals use next_price (Unspent Cash unchanged)
+    await cfg_col.update_one(
+        {"_id": "current"},
+        {"$set": {"items": items, "use_next_for_total": True, "next_year": int(year), "updated_at": int(datetime.now().timestamp())}}
     )
+
+    preview = "\n".join([f"{c}: {items[c]['name']} — {items[c]['price']} → **{items[c]['next_price']}** ({ch.get(c,0)}%)"
+                         for c in ITEM_CODES])
+    await interaction.followup.send(embed=Embed(
+        title=f"Next-Year Revealed — {year}",
+        description=preview,
+        colour=BOT_COLOUR
+    ))
+
+# ---------- NEW: /stock_change clear_inventories ----------
+@stock_change_cmd.subcommand(
+    name="clear_inventories",
+    description="Owner: set everyone’s holdings to 0 (Unspent Cash unchanged)."
+)
+async def stock_change_clear_inventories(
+    interaction: Interaction,
+    confirm: str = SlashOption(description="Type CONFIRM to proceed.", required=True),
+):
+    await interaction.response.defer(ephemeral=True)
+    if interaction.user.id != OWNER_ID:
+        await interaction.followup.send("❌ Owner only.")
+        return
+    if confirm != "CONFIRM":
+        await interaction.followup.send("❌ Type `CONFIRM` to proceed.")
+        return
+
+    port_col = db_client.market.portfolios
+    zero_holdings = {code: 0 for code in ITEM_CODES}
+    res = await port_col.update_many({}, {"$set": {"holdings": zero_holdings, "updated_at": int(datetime.now().timestamp())}})
+    await interaction.followup.send(f"✅ Cleared holdings for **{res.modified_count}** portfolios. Cash balances unchanged.")
 
 
 
@@ -1302,16 +1476,19 @@ async def r_hint(
         ),
 ):
     await interaction.response.defer()
-    if not confirm == "R HINT":
+    if confirm != "R HINT":
         await interaction.followup.send("Command rejected. Put ``R HINT`` in the ``confirm`` option to use an r hint.")
         return
-    db = db_client.hint_points
-    hint_collection = db.balance
+
+    # Load user's hint bank
+    hint_collection = db_client.hint_points.balance
     hint_bank = await hint_collection.find_one({"_id": str(interaction.user.id)})
     if hint_bank is None:
-        await interaction.followup.send("You don't have a hint point bank. Contact Lunarisk to get one.")
+        await interaction.followup.send(_signup_needed_msg_self())
         return
-    hint_points = hint_bank["balance"]
+
+    # Balance check
+    hint_points = int(hint_bank.get("balance", 0))
     if hint_points < 1:
         hint_bank["history"].sort(key=lambda x: x["time"], reverse=True)
         history = paginate_list(hint_bank["history"])
@@ -1323,47 +1500,46 @@ async def r_hint(
             view=balance_view,
         )
         return
-    else:
-        db = db_client.stocks
-        collection = db.changes
-        years = []
-        async for year in collection.find({}):
-            years.append(year)
-        years.sort(key=lambda year: year['_id'])
-        years = years[:-1]
-        if not years:
-            await interaction.followup.send("There is no stock info in this bot's database.\n"
-                                            "Either Lunarisk did not update stock info,"
-                                            " or this is the start of a season (All stocks 50%).")
-            return
-        odds = calculate_odds(years)
-        hint_bank["balance"] -= 1
-        history_entry = {
-            "time": int(datetime.now().timestamp()),
-            "change": -1,
-            "new_balance": hint_bank["balance"],
-            "user_id": str(bot.user.id),
-            "reason": f"Used R-hint."
-        }
-        hint_bank["history"].append(history_entry)
-        updates = {
-            "balance": hint_bank["balance"],
-            "history": hint_bank["history"],
-        }
-        await hint_collection.update_one({"_id": str(interaction.user.id)}, {"$set": updates})
-        hint_bank["history"].sort(key=lambda x: x["time"], reverse=True)
-        history = paginate_list(hint_bank["history"])
-        balance_view = BankBalanceViewer(0, hint_bank["balance"], history, interaction.user)
-        balance_embed = format_balance_embed(balance_view)
-        odd_info = "Used R-hint!\n\n"
-        for stock, odd in odds.items():
-            odd_info += f"{stock}: {odd}%\n"
+
+    # Build odds from all years except latest (R-hint rule)
+    collection = db_client.stocks.changes
+    years = [doc async for doc in collection.find({})]
+    years.sort(key=lambda y: y['_id'])
+    years = years[:-1]
+    if not years:
         await interaction.followup.send(
-            odd_info,
-            embed=balance_embed,
-            view=balance_view,
+            "There is no stock info in this bot's database.\n"
+            "Either the host did not update stock info, or this is the start of a season (All stocks 50%)."
         )
         return
+
+    odds = calculate_odds(years)
+
+    # Deduct 1 HP
+    hint_bank["balance"] = int(hint_bank["balance"]) - 1
+    history_entry = {
+        "time": int(datetime.now().timestamp()),
+        "change": -1,
+        "new_balance": hint_bank["balance"],
+        "user_id": str(bot.user.id),
+        "reason": "Used R-hint."
+    }
+    hint_bank["history"].append(history_entry)
+    await hint_collection.update_one({"_id": str(interaction.user.id)}, {"$set": {
+        "balance": hint_bank["balance"],
+        "history": hint_bank["history"],
+    }})
+
+    # Pretty-print with names
+    items_cfg = (await _get_market_config() or {}).get("items", {})
+    odd_lines = [f"{_item_label(code, items_cfg)}: {pct}%"
+                 for code, pct in odds.items()]
+    hint_bank["history"].sort(key=lambda x: x["time"], reverse=True)
+    history = paginate_list(hint_bank["history"])
+    balance_view = BankBalanceViewer(0, hint_bank["balance"], history, interaction.user)
+    balance_embed = format_balance_embed(balance_view)
+
+    await interaction.followup.send("Used R-hint!\n\n" + "\n".join(odd_lines),embed=balance_embed,view=balance_view,)
 
 @use_hint.subcommand(
     name="lvl1",
@@ -1374,7 +1550,7 @@ async def lvl1_hint(
         stock: str = SlashOption(
             description="The stock you want to use this hint on.",
             required=True,
-            choices=[stock for stock in "ABCDEFGH"]
+            choices=[s for s in "ABCDEFGH"]
         ),
         confirm: str = SlashOption(
             description="put LVL1 in this to proceed.",
@@ -1382,16 +1558,19 @@ async def lvl1_hint(
         ),
 ):
     await interaction.response.defer()
-    if not confirm == "LVL1":
+    if confirm != "LVL1":
         await interaction.followup.send("Command rejected. Put ``LVL1`` in the ``confirm`` option to use a hint.")
         return
-    db = db_client.hint_points
-    hint_collection = db.balance
+
+    # Bank lookup
+    hint_collection = db_client.hint_points.balance
     hint_bank = await hint_collection.find_one({"_id": str(interaction.user.id)})
     if hint_bank is None:
-        await interaction.followup.send("You don't have a hint point bank. Contact Lunarisk to get one.")
+        await interaction.followup.send(_signup_needed_msg_self())
         return
-    hint_points = hint_bank["balance"]
+
+    # Balance check
+    hint_points = int(hint_bank.get("balance", 0))
     if hint_points < 1:
         hint_bank["history"].sort(key=lambda x: x["time"], reverse=True)
         history = paginate_list(hint_bank["history"])
@@ -1403,53 +1582,51 @@ async def lvl1_hint(
             view=balance_view,
         )
         return
-    else:
-        db = db_client.stocks
-        collection = db.changes
-        years = []
-        async for year in collection.find({}):
-            years.append(year)
-        years.sort(key=lambda year: year['_id'])
-        try:
-            year = years[-1]
-        except IndexError:
-            await interaction.followup.send("There is no stock info in this bot's database.\n"
-                                            "Either Lunarisk did not update stock info,"
-                                            " or this is the start of a season (All stocks 50%).")
-            return
-        stock_change = year[stock]
-        odds_change = ODDS[stock_change]
-        change_info = "Used level 1 hint!\n\n"
-        if abs(odds_change) <= 3:
-            change_info += f"Change of stock {stock}: **Low**"
-        elif abs(odds_change) <= 9:
-            change_info += f"Change of stock {stock}: **Medium**"
-        else:
-            change_info += f"Change of stock {stock}: **High**"
-        hint_bank["balance"] -= 1
-        history_entry = {
-            "time": int(datetime.now().timestamp()),
-            "change": -1,
-            "new_balance": hint_bank["balance"],
-            "user_id": str(bot.user.id),
-            "reason": f"Used level 1 hint on stock {stock}."
-        }
-        hint_bank["history"].append(history_entry)
-        updates = {
-            "balance": hint_bank["balance"],
-            "history": hint_bank["history"],
-        }
-        await hint_collection.update_one({"_id": str(interaction.user.id)}, {"$set": updates})
-        hint_bank["history"].sort(key=lambda x: x["time"], reverse=True)
-        history = paginate_list(hint_bank["history"])
-        balance_view = BankBalanceViewer(0, hint_bank["balance"], history, interaction.user)
-        balance_embed = format_balance_embed(balance_view)
+
+    # Latest year change
+    collection = db_client.stocks.changes
+    years = [doc async for doc in collection.find({})]
+    years.sort(key=lambda y: y['_id'])
+    if not years:
         await interaction.followup.send(
-            change_info,
-            embed=balance_embed,
-            view=balance_view,
+            "There is no stock info in this bot's database.\n"
+            "Either the host did not update stock info, or this is the start of a season (All stocks 50%)."
         )
         return
+    latest = years[-1]
+    stock_change = int(latest[stock])
+    odds_change = int(ODDS[stock_change])
+
+    # Strength buckets
+    items_cfg = (await _get_market_config() or {}).get("items", {})
+    label = _item_label(stock, items_cfg)
+    if abs(odds_change) <= 3:
+        strength = "**Low**"
+    elif abs(odds_change) <= 9:
+        strength = "**Medium**"
+    else:
+        strength = "**High**"
+    change_info = f"Used level 1 hint!\n\nChange of {label}: {strength}"
+
+    # Deduct 1 HP
+    hint_bank["balance"] -= 1
+    hint_bank["history"].append({
+        "time": int(datetime.now().timestamp()),
+        "change": -1,
+        "new_balance": hint_bank["balance"],
+        "user_id": str(bot.user.id),
+        "reason": f"Used level 1 hint on stock {stock}."
+    })
+    await hint_collection.update_one({"_id": str(interaction.user.id)}, {"$set": {
+        "balance": hint_bank["balance"],
+        "history": hint_bank["history"],
+    }})
+
+    hint_bank["history"].sort(key=lambda x: x["time"], reverse=True)
+    history = paginate_list(hint_bank["history"])
+    balance_view = BankBalanceViewer(0, hint_bank["balance"], history, interaction.user)
+    balance_embed = format_balance_embed(balance_view)
+    await interaction.followup.send(change_info, embed=balance_embed, view=balance_view)
 
 @use_hint.subcommand(
     name="lvl2",
@@ -1460,7 +1637,7 @@ async def lvl2_hint(
         stock: str = SlashOption(
             description="The stock you want to use this hint on.",
             required=True,
-            choices=[stock for stock in "ABCDEFGH"]
+            choices=[s for s in "ABCDEFGH"]
         ),
         confirm: str = SlashOption(
             description="put LVL2 in this to proceed.",
@@ -1468,16 +1645,19 @@ async def lvl2_hint(
         ),
 ):
     await interaction.response.defer()
-    if not confirm == "LVL2":
+    if confirm != "LVL2":
         await interaction.followup.send("Command rejected. Put ``LVL2`` in the ``confirm`` option to use a hint.")
         return
-    db = db_client.hint_points
-    hint_collection = db.balance
+
+    # Bank lookup
+    hint_collection = db_client.hint_points.balance
     hint_bank = await hint_collection.find_one({"_id": str(interaction.user.id)})
     if hint_bank is None:
-        await interaction.followup.send("You don't have a hint point bank. Contact Lunarisk to get one.")
+        await interaction.followup.send(_signup_needed_msg_self())
         return
-    hint_points = hint_bank["balance"]
+
+    # Balance check
+    hint_points = int(hint_bank.get("balance", 0))
     if hint_points < 2:
         hint_bank["history"].sort(key=lambda x: x["time"], reverse=True)
         history = paginate_list(hint_bank["history"])
@@ -1489,55 +1669,58 @@ async def lvl2_hint(
             view=balance_view,
         )
         return
-    else:
-        db = db_client.stocks
-        collection = db.changes
-        years = []
-        async for year in collection.find({}):
-            years.append(year)
-        years.sort(key=lambda year: year['_id'])
-        try:
-            year = years[-1]
-        except IndexError:
-            await interaction.followup.send("There is no stock info in this bot's database.\n"
-                                            "Either Lunarisk did not update stock info,"
-                                            " or this is the start of a season (All stocks 50%).")
-            return
-        stock_change = year[stock]
-        odds_change = ODDS[stock_change]
-        change_info = "Used level 2 hint!\n\n"
-        for change, other_odd_change in ODDS.items():
-            if other_odd_change == -odds_change:
-                opposite_change = change
-                break
-        if opposite_change > stock_change:
-            change_info += f"Possible changes for stock {stock}: **{opposite_change}%, {stock_change}%**"
-        else:
-            change_info += f"Possible changes for stock {stock}: **{stock_change}%, {opposite_change}%**"
-        hint_bank["balance"] -= 2
-        history_entry = {
-            "time": int(datetime.now().timestamp()),
-            "change": -2,
-            "new_balance": hint_bank["balance"],
-            "user_id": str(bot.user.id),
-            "reason": f"Used level 2 hint on stock {stock}."
-        }
-        hint_bank["history"].append(history_entry)
-        updates = {
-            "balance": hint_bank["balance"],
-            "history": hint_bank["history"],
-        }
-        await hint_collection.update_one({"_id": str(interaction.user.id)}, {"$set": updates})
-        hint_bank["history"].sort(key=lambda x: x["time"], reverse=True)
-        history = paginate_list(hint_bank["history"])
-        balance_view = BankBalanceViewer(0, hint_bank["balance"], history, interaction.user)
-        balance_embed = format_balance_embed(balance_view)
+
+    # Latest year change
+    collection = db_client.stocks.changes
+    years = [doc async for doc in collection.find({})]
+    years.sort(key=lambda y: y['_id'])
+    if not years:
         await interaction.followup.send(
-            change_info,
-            embed=balance_embed,
-            view=balance_view,
+            "There is no stock info in this bot's database.\n"
+            "Either the host did not update stock info, or this is the start of a season (All stocks 50%)."
         )
         return
+    latest = years[-1]
+    stock_change = int(latest[stock])
+    odds_change = int(ODDS[stock_change])
+
+    # Find opposite-odds change (safe init)
+    opposite_change = None
+    for change, other_odd_change in ODDS.items():
+        if int(other_odd_change) == -odds_change:
+            opposite_change = int(change)
+            break
+
+    items_cfg = (await _get_market_config() or {}).get("items", {})
+    label = _item_label(stock, items_cfg)
+
+    if opposite_change is None:
+        # Fallback: just show the known change twice (edge case)
+        pair = (stock_change, stock_change)
+    else:
+        pair = tuple(sorted([stock_change, opposite_change]))
+
+    change_info = f"Used level 2 hint!\n\nPossible changes for {label}: **{pair[0]}%, {pair[1]}%**"
+
+    # Deduct 2 HP
+    hint_bank["balance"] -= 2
+    hint_bank["history"].append({
+        "time": int(datetime.now().timestamp()),
+        "change": -2,
+        "new_balance": hint_bank["balance"],
+        "user_id": str(bot.user.id),
+        "reason": f"Used level 2 hint on stock {stock}."
+    })
+    await hint_collection.update_one({"_id": str(interaction.user.id)}, {"$set": {
+        "balance": hint_bank["balance"],
+        "history": hint_bank["history"],
+    }})
+
+    hint_bank["history"].sort(key=lambda x: x["time"], reverse=True)
+    history = paginate_list(hint_bank["history"])
+    balance_view = BankBalanceViewer(0, hint_bank["balance"], history, interaction.user)
+    balance_embed = format_balance_embed(balance_view)
+    await interaction.followup.send(change_info, embed=balance_embed, view=balance_view)
 
 @use_hint.subcommand(
     name="lvl3",
@@ -1548,7 +1731,7 @@ async def lvl3_hint(
         stock: str = SlashOption(
             description="The stock you want to use this hint on.",
             required=True,
-            choices=[stock for stock in "ABCDEFGH"]
+            choices=[s for s in "ABCDEFGH"]
         ),
         confirm: str = SlashOption(
             description="put LVL3 in this to proceed.",
@@ -1556,16 +1739,19 @@ async def lvl3_hint(
         ),
 ):
     await interaction.response.defer()
-    if not confirm == "LVL3":
+    if confirm != "LVL3":
         await interaction.followup.send("Command rejected. Put ``LVL3`` in the ``confirm`` option to use a hint.")
         return
-    db = db_client.hint_points
-    hint_collection = db.balance
+
+    # Bank lookup
+    hint_collection = db_client.hint_points.balance
     hint_bank = await hint_collection.find_one({"_id": str(interaction.user.id)})
     if hint_bank is None:
-        await interaction.followup.send("You don't have a hint point bank. Contact Lunarisk to get one.")
+        await interaction.followup.send(_signup_needed_msg_self())
         return
-    hint_points = hint_bank["balance"]
+
+    # Balance check
+    hint_points = int(hint_bank.get("balance", 0))
     if hint_points < 3:
         hint_bank["history"].sort(key=lambda x: x["time"], reverse=True)
         history = paginate_list(hint_bank["history"])
@@ -1577,52 +1763,51 @@ async def lvl3_hint(
             view=balance_view,
         )
         return
-    else:
-        db = db_client.stocks
-        collection = db.changes
-        years = []
-        async for year in collection.find({}):
-            years.append(year)
-        years.sort(key=lambda year: year['_id'])
-        try:
-            year = years[-1]
-        except IndexError:
-            await interaction.followup.send("There is no stock info in this bot's database.\n"
-                                            "Either Lunarisk did not update stock info,"
-                                            " or this is the start of a season (All stocks 50%).")
-            return
-        stock_change = year[stock]
-        change_info = "Used level 3 hint!\n\n"
-        if stock_change > 0:
-            change_info += f"Stock {stock} will **increase**"
-        elif stock_change < 0:
-            change_info += f"Stock {stock} will **decrease**"
-        else:
-            change_info += f"Stock {stock} will **not change in price**"
-        hint_bank["balance"] -= 3
-        history_entry = {
-            "time": int(datetime.now().timestamp()),
-            "change": -3,
-            "new_balance": hint_bank["balance"],
-            "user_id": str(bot.user.id),
-            "reason": f"Used level 3 hint on stock {stock}."
-        }
-        hint_bank["history"].append(history_entry)
-        updates = {
-            "balance": hint_bank["balance"],
-            "history": hint_bank["history"],
-        }
-        await hint_collection.update_one({"_id": str(interaction.user.id)}, {"$set": updates})
-        hint_bank["history"].sort(key=lambda x: x["time"], reverse=True)
-        history = paginate_list(hint_bank["history"])
-        balance_view = BankBalanceViewer(0, hint_bank["balance"], history, interaction.user)
-        balance_embed = format_balance_embed(balance_view)
+
+    # Latest year change
+    collection = db_client.stocks.changes
+    years = [doc async for doc in collection.find({})]
+    years.sort(key=lambda y: y['_id'])
+    if not years:
         await interaction.followup.send(
-            change_info,
-            embed=balance_embed,
-            view=balance_view,
+            "There is no stock info in this bot's database.\n"
+            "Either the host did not update stock info, or this is the start of a season (All stocks 50%)."
         )
         return
+    latest = years[-1]
+    stock_change = int(latest[stock])
+
+    items_cfg = (await _get_market_config() or {}).get("items", {})
+    label = _item_label(stock, items_cfg)
+
+    if stock_change > 0:
+        msg = f"{label} will **increase**"
+    elif stock_change < 0:
+        msg = f"{label} will **decrease**"
+    else:
+        msg = f"{label} will **not change in price**"
+
+    change_info = "Used level 3 hint!\n\n" + msg
+
+    # Deduct 3 HP
+    hint_bank["balance"] -= 3
+    hint_bank["history"].append({
+        "time": int(datetime.now().timestamp()),
+        "change": -3,
+        "new_balance": hint_bank["balance"],
+        "user_id": str(bot.user.id),
+        "reason": f"Used level 3 hint on stock {stock}."
+    })
+    await hint_collection.update_one({"_id": str(interaction.user.id)}, {"$set": {
+        "balance": hint_bank["balance"],
+        "history": hint_bank["history"],
+    }})
+
+    hint_bank["history"].sort(key=lambda x: x["time"], reverse=True)
+    history = paginate_list(hint_bank["history"])
+    balance_view = BankBalanceViewer(0, hint_bank["balance"], history, interaction.user)
+    balance_embed = format_balance_embed(balance_view)
+    await interaction.followup.send(change_info, embed=balance_embed, view=balance_view)
 
 @bot.message_command(name="Get Unix timestamp")
 async def command_rac_time(interaction: Interaction, sent_message: Message):

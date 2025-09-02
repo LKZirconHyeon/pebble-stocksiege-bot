@@ -118,6 +118,29 @@ def _portfolio_totals_with_mode(items_cfg: dict, portfolio: dict, use_next: bool
         total_val += q * price
     return cash, cash + total_val
 
+def _portfolio_value(items_cfg: dict, portfolio: dict, use_next: bool) -> int:
+    """(Informational) mark-to-market value of holdings at current/next prices."""
+    holdings = portfolio.get("holdings", {})
+    total_val = 0
+    for code in ITEM_CODES:
+        q = int(holdings.get(code, 0))
+        if q <= 0 or code not in items_cfg:
+            continue
+        base = int(items_cfg[code]["price"])
+        p = int(items_cfg[code].get("next_price", base)) if use_next else base
+        total_val += q * p
+    return total_val
+
+def _invested_cost_basis(portfolio: dict) -> int:
+    """How much of the bankroll is currently invested (at purchase cost).
+    Since purchases decrease cash by exactly their cost, and sells refund it,
+    cost basis = STARTING_CASH - current_unspent_cash."""
+    return max(0, int(STARTING_CASH) - int(portfolio.get("cash", 0)))
+
+def _total_cash_constant(portfolio: dict) -> int:
+    """Total Cash = Unspent + cost basis (constant = STARTING_CASH)."""
+    return int(STARTING_CASH)
+
 def _resolve_item_code(cfg_items: dict, ident: str) -> str | None:
     """
     ident: 'A'~'H' or configured name (case-insensitive).
@@ -164,7 +187,6 @@ def _parse_orders(orders_raw: str) -> list[tuple[str, int]]:
         raise ValueError("No valid (item, quantity) pairs found.")
     return parsed
 
-# Build a safe mention string for "/signup join"
 def signup_join_mention() -> str:
     try:
         return signup_join.get_mention(guild=None)
@@ -198,6 +220,57 @@ def _signup_needed_msg_self() -> str:
         "You don’t have a Hint Point Inventory (you haven’t signed up yet).\n\n"
         f"Please run {mention} to sign up and create one (0 pt)."
     )
+
+def _holdings_valuation(items_cfg: dict, portfolio: dict, use_next: bool) -> int:
+    """Sum(qty × price_mode) for the portfolio's holdings."""
+    holdings = portfolio.get("holdings", {})
+    total = 0
+    for code in ITEM_CODES:
+        qty = int(holdings.get(code, 0))
+        if qty <= 0 or code not in items_cfg:
+            continue
+        base = int(items_cfg[code]["price"])
+        price = int(items_cfg[code].get("next_price", base)) if use_next else base
+        total += qty * price
+    return total
+
+def _parse_orders(raw: str) -> list[tuple[str, int]]:
+    """
+    Parse order text into [(identifier, qty), ...].
+    Accepts 'A 10', '10 A', 'Clothing 3', '3 Clothing'.
+    Ident can include spaces; quantity must be an integer > 0.
+    """
+    if not raw or not raw.strip():
+        raise ValueError("No orders found.")
+
+    import re
+    pairs: list[tuple[str, int]] = []
+    # split by , ; | or newline — but keep chunks with spaces inside (for names)
+    chunks = re.split(r"[,\n;|]+", raw)
+    for chunk in chunks:
+        s = chunk.strip()
+        if not s:
+            continue
+
+        # Try [ident][qty] (e.g., "A 10" / "Clothing 3")
+        m = re.match(r"^(?P<ident>.+?)\s+(?P<qty>\d+)$", s)
+        if not m:
+            # Try [qty][ident] (e.g., "10 A" / "3 Clothing")
+            m = re.match(r"^(?P<qty>\d+)\s+(?P<ident>.+)$", s)
+        if not m:
+            raise ValueError(f"Cannot parse: `{s}`")
+
+        ident = m.group("ident").strip()
+        qty = int(m.group("qty"))
+        if qty <= 0:
+            raise ValueError(f"Quantity must be positive: `{s}`")
+
+        pairs.append((ident, qty))
+
+    if not pairs:
+        raise ValueError("No valid orders parsed.")
+    return pairs
+
 # Base Format Layers
 
 
@@ -537,28 +610,64 @@ async def signup_reset(
             except:
                 pass
 
-    # Apply 버튼
+    # Apply button (replace your whole class)
     class ApplyButton(Button):
         def __init__(self):
             super().__init__(style=ButtonStyle.danger, label="Apply & Wipe", emoji="🗑️")
 
         async def callback(self, btn_inter: Interaction):
-            # 실제 삭제 + 신규 설정 저장
+            # 1) ACK immediately so we don't hit 10062
+            await btn_inter.response.defer()  # original preview was ephemeral already
+
+            # 2) Wipe
             try:
-                # 1) 참여자/힌트/포트폴리오 삭제
                 sres = await db_client.players.signups.delete_many({})
                 bres = await db_client.hint_points.balance.delete_many({})
                 pres = await db_client.market.portfolios.delete_many({})
+                cres = await db_client.stocks.changes.delete_many({})
+                try:
+                    await db_client.stocks.prices.delete_many({})
+                except Exception:
+                    pass  # collection may not exist
+            except Exception as e:
+                await btn_inter.edit_original_message(
+                    content=f"❌ Error while wiping collections: {e}", view=None
+                )
+                return
 
-                # 2) 품목 설정 교체
+            # 3) Write new market config
+            try:
                 cfg_col = db_client.market.config
-                current = await cfg_col.find_one({"_id": "current"})
-                if current:
-                    await cfg_col.delete_one({"_id": "current"})
-                await cfg_col.insert_one({"_id": "current", "items": self.view.items, "updated_at": _now_ts()})
+                clean_items = {
+                    code: {
+                        "name": self.view.items[code]["name"],
+                        "price": int(self.view.items[code]["price"])
+                    } for code in ITEM_CODES
+                }
 
-                # 버튼 비활성 + 완료 메시지
-                await btn_inter.response.edit_message(
+                await cfg_col.update_one(
+                    {"_id": "current"},
+                    {
+                        "$set": {
+                            "items": clean_items,
+                            "updated_at": int(datetime.now().timestamp())
+                        },
+                        "$unset": {
+                            "use_next_for_total": "",
+                            "next_year": ""
+                        }
+                    },
+                    upsert=True
+                )
+
+                # Build preview text
+                preview_lines = [
+                    f"{c}: **{clean_items[c]['name']}** — {clean_items[c]['price']}"
+                    for c in ITEM_CODES
+                ]
+
+                # 4) Edit the original message (remove buttons by setting view=None)
+                await btn_inter.edit_original_message(
                     embed=Embed(
                         title="✅ Reset Applied",
                         description=(
@@ -566,17 +675,16 @@ async def signup_reset(
                             f"- Deleted signups: {sres.deleted_count}\n"
                             f"- Deleted hint banks: {bres.deleted_count}\n"
                             f"- Deleted portfolios: {pres.deleted_count}\n\n"
-                            "**New Items (A~H)**\n" + 
-                            "\n".join([f"{c}: **{self.view.items[c]['name']}** — {self.view.items[c]['price']}" for c in ITEM_CODES])
+                            f"- Deleted stock changes: {cres.deleted_count}\n"
+                            "**New Items (A~H)**\n" + "\n".join(preview_lines)
                         ),
                         colour=BOT_COLOUR
                     ),
                     view=None
                 )
             except Exception as e:
-                await btn_inter.response.edit_message(
-                    content=f"❌ Error during reset: {e}",
-                    view=None
+                await btn_inter.edit_original_message(
+                    content=f"❌ Error while writing new market config: {e}", view=None
                 )
 
     # Cancel 버튼
@@ -912,11 +1020,10 @@ def _portfolio_totals(items_cfg: dict, portfolio: dict) -> tuple[int, int]:
 # ---------- Public: see configurable items ----------
 @market_cmd.subcommand(
     name="view",
-    description="View current stock items (A–H) and prices."
+    description="View current market items (A–H)."
 )
 async def market_view(interaction: Interaction):
-    """Public: show item codes A–H with their configured names & prices."""
-    await interaction.response.defer()  # public reply
+    await interaction.response.defer(ephemeral=True)
 
     cfg = await _get_market_config()
     if not cfg or "items" not in cfg:
@@ -924,20 +1031,20 @@ async def market_view(interaction: Interaction):
         return
 
     items = cfg["items"]
+    use_next = bool(cfg.get("use_next_for_total"))  # set by /stock_change reveal_next
+    caption = "Valuation uses NEXT-year prices" if use_next else "Valuation uses current prices"
+
     lines = []
     for code in ITEM_CODES:
-        info = items.get(code)
-        if not info:
-            lines.append(f"{code}: _(not set)_")
-            continue
-        nm = info.get("name", "(unnamed)")
-        pr = info.get("price", "?")
-        lines.append(f"{code}: **{nm}** — {pr}")
+        info = items.get(code, {})
+        name = info.get("name", code)
+        price = int(info.get("next_price" if use_next else "price", 0))
+        lines.append(f"**{code}: {name}** — {price:,}")
 
     await interaction.followup.send(
         embed=Embed(
             title="Market Items (A–H)",
-            description="\n".join(lines),
+            description=f"*{caption}*\n\n" + "\n".join(lines),
             colour=BOT_COLOUR
         )
     )
@@ -964,6 +1071,7 @@ async def market_portfolio(interaction: Interaction):
 
     use_next = await _use_next_prices_flag()
 
+    # holdings list (keep; uses the same pricing mode)
     holdings_lines = []
     for code in ITEM_CODES:
         qty = int(pf["holdings"].get(code, 0))
@@ -971,15 +1079,17 @@ async def market_portfolio(interaction: Interaction):
             base = int(items[code]["price"])
             p = int(items[code].get("next_price", base)) if use_next else base
             value = qty * p
-            name = items[code]["name"]
-            holdings_lines.append(f"{code} - {name}: {qty} (≈ {value})")
+            holdings_lines.append(f"{code} - {items[code]['name']}: {qty} (≈ {value})")
 
-    unspent, total = _portfolio_totals_with_mode(items, pf, use_next)
+    unspent = int(pf["cash"])
+    valuation = _holdings_valuation(items, pf, use_next)  # <-- value of holdings at chosen mode
+    total_cash = unspent + valuation                       # <-- the rule you want
+
     mode_label = "NEXT-year prices" if use_next else "current prices"
     desc = (
         f"_Valuation uses {mode_label}_\n\n"
         f"**Unspent Cash**: {unspent}\n"
-        f"**Total Cash**: {total}\n\n" +
+        f"**Total Cash**: {total_cash}\n\n" +
         ("**Holdings**\n" + "\n".join(holdings_lines) if holdings_lines else "_No holdings_")
     )
     await interaction.followup.send(embed=Embed(
@@ -1017,6 +1127,9 @@ async def market_admin_view(
         return
 
     use_next = await _use_next_prices_flag()
+    unspent = int(pf["cash"])
+    valuation = _holdings_valuation(items, pf, use_next)
+    total_cash = unspent + valuation
 
     holdings_lines = []
     for code in ITEM_CODES:
@@ -1033,7 +1146,7 @@ async def market_admin_view(
     desc = (
         f"_Valuation uses {mode_label}_\n\n"
         f"**Unspent Cash**: {unspent}\n"
-        f"**Total Cash**: {total}\n\n" +
+        f"**Total Cash**: {total_cash}\n\n" +
         ("**Holdings**\n" + "\n".join(holdings_lines) if holdings_lines else "_No holdings_")
     )
     await interaction.followup.send(embed=Embed(
@@ -1042,9 +1155,9 @@ async def market_admin_view(
         colour=BOT_COLOUR
     ))
 
-# ---------- Purchase: spend Unspent Cash to increase holdings ----------
+# ---------- Buy: spend Unspent Cash to increase holdings ----------
 @market_cmd.subcommand(
-    name="purchase",
+    name="buy",
     description="Buy items. Multiple pairs allowed (e.g., 'A 10, Apple 3')."
 )
 async def market_purchase(
@@ -1419,7 +1532,7 @@ async def stock_change_reveal_next(
 # ---------- NEW: /stock_change clear_inventories ----------
 @stock_change_cmd.subcommand(
     name="clear_inventories",
-    description="Owner: set everyone’s holdings to 0 (Unspent Cash unchanged)."
+    description="Owner: liquidate holdings into Unspent at the currently shown prices."
 )
 async def stock_change_clear_inventories(
     interaction: Interaction,
@@ -1433,10 +1546,39 @@ async def stock_change_clear_inventories(
         await interaction.followup.send("❌ Type `CONFIRM` to proceed.")
         return
 
-    port_col = db_client.market.portfolios
+    # Which price mode are we using? (current vs NEXT)
+    cfg = await db_client.market.config.find_one({"_id": "current"})
+    if not cfg or "items" not in cfg:
+        await interaction.followup.send("❌ Market is not configured.")
+        return
+    items = cfg["items"]
+    use_next = bool(cfg.get("use_next_for_total"))
+
+    portfolios = db_client.market.portfolios
     zero_holdings = {code: 0 for code in ITEM_CODES}
-    res = await port_col.update_many({}, {"$set": {"holdings": zero_holdings, "updated_at": int(datetime.now().timestamp())}})
-    await interaction.followup.send(f"✅ Cleared holdings for **{res.modified_count}** portfolios. Cash balances unchanged.")
+
+    modified = 0
+    async for pf in portfolios.find({}):
+        uid = pf["_id"]
+        cash_now = int(pf.get("cash", 0))
+        valuation = _holdings_valuation(items, pf, use_next)  # value at visible mode
+        new_cash = cash_now + valuation                         # liquidate into cash
+
+        res = await portfolios.update_one(
+            {"_id": uid},
+            {"$set": {
+                "cash": new_cash,
+                "holdings": zero_holdings,
+                "updated_at": _now_ts()
+            }}
+        )
+        modified += res.modified_count
+
+    mode_label = "NEXT-year prices" if use_next else "current prices"
+    await interaction.followup.send(
+        f"✅ Cleared holdings for **{modified}** portfolios. "
+        f"Liquidated at **{mode_label}**; Total Cash unchanged for each player."
+    )
 
 
 

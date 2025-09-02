@@ -271,6 +271,10 @@ def _parse_orders(raw: str) -> list[tuple[str, int]]:
         raise ValueError("No valid orders parsed.")
     return pairs
 
+def fmt_pct2_signed(x: float) -> str:
+    """Format with sign and 2 decimals, e.g., +12.34% / -0.50%."""
+    return f"{x:+.2f}%"
+
 # Base Format Layers
 
 
@@ -1070,6 +1074,9 @@ async def market_portfolio(interaction: Interaction):
         return
 
     use_next = await _use_next_prices_flag()
+    # Always compute both baselines
+    _, total_current = _portfolio_totals_with_mode(items, pf, use_next=False)
+    unspent, total_shown = _portfolio_totals_with_mode(items, pf, use_next=use_next)
 
     # holdings list (keep; uses the same pricing mode)
     holdings_lines = []
@@ -1083,14 +1090,23 @@ async def market_portfolio(interaction: Interaction):
 
     unspent = int(pf["cash"])
     valuation = _holdings_valuation(items, pf, use_next)  # <-- value of holdings at chosen mode
-    total_cash = unspent + valuation                       # <-- the rule you want
+    total_cash = unspent + valuation                   # <-- the rule you want
+
+    change_line = ""
+    if use_next:
+        if total_current > 0:
+            pct = (total_cash / total_current - 1.0) * 100.0
+            change_line = f"\n**Change vs current:** {fmt_pct2_signed(pct)}"
+        else:
+            change_line = "\n**Change vs current:** N/A"
 
     mode_label = "NEXT-year prices" if use_next else "current prices"
     desc = (
         f"_Valuation uses {mode_label}_\n\n"
         f"**Unspent Cash**: {unspent}\n"
-        f"**Total Cash**: {total_cash}\n\n" +
-        ("**Holdings**\n" + "\n".join(holdings_lines) if holdings_lines else "_No holdings_")
+        f"**Total Cash**: {total_cash}"
+        f"{change_line}\n\n"
+        + ("**Holdings**\n" + "\n".join(holdings_lines) if holdings_lines else "_No holdings_")
     )
     await interaction.followup.send(embed=Embed(
         title=f"Portfolio — {interaction.user.display_name}",
@@ -1127,6 +1143,9 @@ async def market_admin_view(
         return
 
     use_next = await _use_next_prices_flag()
+    _, total_current = _portfolio_totals_with_mode(items, pf, use_next=False)
+    unspent, total_cash = _portfolio_totals_with_mode(items, pf, use_next=use_next)
+
     unspent = int(pf["cash"])
     valuation = _holdings_valuation(items, pf, use_next)
     total_cash = unspent + valuation
@@ -1141,13 +1160,22 @@ async def market_admin_view(
             name = items[code]["name"]
             holdings_lines.append(f"{code} - {name}: {qty} (≈ {value})")
 
+    change_line = ""
+    if use_next:
+        if total_current > 0:
+            pct = (total_cash / total_current - 1.0) * 100.0
+            change_line = f"\n**Change vs current:** {fmt_pct2_signed(pct)}"
+        else:
+            change_line = "\n**Change vs current:** N/A"
+
     unspent, total = _portfolio_totals_with_mode(items, pf, use_next)
     mode_label = "NEXT-year prices" if use_next else "current prices"
     desc = (
         f"_Valuation uses {mode_label}_\n\n"
         f"**Unspent Cash**: {unspent}\n"
-        f"**Total Cash**: {total_cash}\n\n" +
-        ("**Holdings**\n" + "\n".join(holdings_lines) if holdings_lines else "_No holdings_")
+        f"**Total Cash**: {total_cash}"
+        f"{change_line}\n\n"
+        + ("**Holdings**\n" + "\n".join(holdings_lines) if holdings_lines else "_No holdings_")
     )
     await interaction.followup.send(embed=Embed(
         title=f"Portfolio — {user.display_name}",
@@ -1529,24 +1557,28 @@ async def stock_change_reveal_next(
         colour=BOT_COLOUR
     ))
 
-# ---------- NEW: /stock_change clear_inventories ----------
+# ============= Subcommand "liquidate" of "stock_change" =============
 @stock_change_cmd.subcommand(
-    name="clear_inventories",
+    name="liquidate",
     description="Owner: liquidate holdings into Unspent at the currently shown prices."
 )
-async def stock_change_clear_inventories(
+async def stock_change_liquidate(
     interaction: Interaction,
     confirm: str = SlashOption(description="Type CONFIRM to proceed.", required=True),
 ):
     await interaction.response.defer(ephemeral=True)
+
+    # Owner check
     if interaction.user.id != OWNER_ID:
         await interaction.followup.send("❌ Owner only.")
         return
+
+    # Safety check
     if confirm != "CONFIRM":
         await interaction.followup.send("❌ Type `CONFIRM` to proceed.")
         return
 
-    # Which price mode are we using? (current vs NEXT)
+    # Which price mode are we using? (CURRENT vs NEXT)
     cfg = await db_client.market.config.find_one({"_id": "current"})
     if not cfg or "items" not in cfg:
         await interaction.followup.send("❌ Market is not configured.")
@@ -1559,15 +1591,15 @@ async def stock_change_clear_inventories(
 
     modified = 0
     async for pf in portfolios.find({}):
-        uid = pf["_id"]
-        cash_now = int(pf.get("cash", 0))
-        valuation = _holdings_valuation(items, pf, use_next)  # value at visible mode
-        new_cash = cash_now + valuation                         # liquidate into cash
+        # Totals at the active valuation mode
+        unspent_before = int(pf.get("cash", 0))
+        _, total_at_mode = _portfolio_totals_with_mode(items, pf, use_next=use_next)
 
+        # Liquidate: cash becomes total; holdings go to zero
         res = await portfolios.update_one(
-            {"_id": uid},
+            {"_id": pf["_id"]},
             {"$set": {
-                "cash": new_cash,
+                "cash": int(total_at_mode),
                 "holdings": zero_holdings,
                 "updated_at": _now_ts()
             }}
@@ -1576,9 +1608,10 @@ async def stock_change_clear_inventories(
 
     mode_label = "NEXT-year prices" if use_next else "current prices"
     await interaction.followup.send(
-        f"✅ Cleared holdings for **{modified}** portfolios. "
-        f"Liquidated at **{mode_label}**; Total Cash unchanged for each player."
+        f"✅ Liquidated holdings for **{modified}** portfolios at **{mode_label}**.\n"
+        f"All holdings set to 0; each player’s **Unspent Cash** now equals their **Total Cash** at that mode."
     )
+
 
 
 

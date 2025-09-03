@@ -18,7 +18,6 @@ ODDS = {-80: 20, -75: 18, -70: 15, -60: 12, -50: 10, -45: 9, -40: 8, -35: 7, -30
 NORMAL_STOCK_CHANGES = tuple(ODDS.keys())
 BOT_COLOUR = Colour.from_rgb(169, 46, 33)
 MAX_PLAYERS = 24
-ALLOWED_SIGNUP_CHANNEL_ID = 1309822981576593408  # /signup join Allowed Channel
 
 COLOR_NAME_RE = re.compile(r'^[A-Za-z ]{3,20}$')
 HEX_RE = re.compile(r'^#?(?:[0-9a-fA-F]{6})$')
@@ -28,6 +27,17 @@ MAX_ITEM_UNITS = 9_999_999
 ITEM_CODES = list("ABCDEFGH")
 
 # Base Format Layers
+def _env_int(name: str) -> int | None:
+    """Read a Discord snowflake from env; return None if missing/invalid."""
+    v = os.getenv(name)
+    try:
+        return int(v) if v is not None and v.strip() != "" else None
+    except (TypeError, ValueError):
+        return None
+
+ALLOWED_SIGNUP_CHANNEL_ID: int | None = _env_int("ALLOWED_SIGNUP_CHANNEL_ID")
+ALLOWED_GAME_CATEGORY_ID: int | None = _env_int("ALLOWED_GAME_CATEGORY_ID")
+
 def format_bank_history(history: list[dict]):
     history_text = ""
     for entry in history:
@@ -117,29 +127,6 @@ def _portfolio_totals_with_mode(items_cfg: dict, portfolio: dict, use_next: bool
         price = int(items_cfg[code].get("next_price", base)) if use_next else base
         total_val += q * price
     return cash, cash + total_val
-
-def _portfolio_value(items_cfg: dict, portfolio: dict, use_next: bool) -> int:
-    """(Informational) mark-to-market value of holdings at current/next prices."""
-    holdings = portfolio.get("holdings", {})
-    total_val = 0
-    for code in ITEM_CODES:
-        q = int(holdings.get(code, 0))
-        if q <= 0 or code not in items_cfg:
-            continue
-        base = int(items_cfg[code]["price"])
-        p = int(items_cfg[code].get("next_price", base)) if use_next else base
-        total_val += q * p
-    return total_val
-
-def _invested_cost_basis(portfolio: dict) -> int:
-    """How much of the bankroll is currently invested (at purchase cost).
-    Since purchases decrease cash by exactly their cost, and sells refund it,
-    cost basis = STARTING_CASH - current_unspent_cash."""
-    return max(0, int(STARTING_CASH) - int(portfolio.get("cash", 0)))
-
-def _total_cash_constant(portfolio: dict) -> int:
-    """Total Cash = Unspent + cost basis (constant = STARTING_CASH)."""
-    return int(STARTING_CASH)
 
 def _resolve_item_code(cfg_items: dict, ident: str) -> str | None:
     """
@@ -329,6 +316,57 @@ def _resolve_item_code(items: dict, ident: str) -> str | None:
         if nm == norm:
             return code
     return None
+# ---------- Private Category + public defer helpers ----------
+def _in_game_category(inter: Interaction) -> bool:
+    """Return True if the command is run inside the allowed game category (or no env set)."""
+    if ALLOWED_GAME_CATEGORY_ID is None:
+        return True
+    cat = getattr(inter.channel, "category", None)
+    return getattr(cat, "id", None) == ALLOWED_GAME_CATEGORY_ID
+
+from functools import wraps
+
+def guard(*, require_private: bool, public: bool, require_unlocked: bool = False, owner_only: bool = False):
+    """
+    Unified gate for commands:
+      - require_private: only allow channels under ALLOWED_GAME_CATEGORY_ID
+      - public: force non-ephemeral replies (defers publicly)
+      - require_unlocked: block when global trading/hints lock is on
+      - owner_only: restrict to OWNER_ID
+    """
+    def deco(func):
+        @wraps(func)
+        async def wrapper(interaction: Interaction, *args, **kwargs):
+            # Owner gate (public error)
+            if owner_only and interaction.user.id != OWNER_ID:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("❌ Owner only.", ephemeral=False)
+                else:
+                    await interaction.followup.send("❌ Owner only.")
+                return
+
+            # Private category gate (public error)
+            if require_private and not _in_game_category(interaction):
+                msg = f"❌ This command can only be used in channels under <#{ALLOWED_GAME_CATEGORY_ID}>."
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(msg, ephemeral=False)
+                else:
+                    await interaction.followup.send(msg)
+                return
+
+            # Force public defer if requested
+            if public and not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=False)
+
+            # Global “interaction grant” (trading & hints) lock
+            if require_unlocked and await _trading_locked():
+                await interaction.followup.send("❌ Trading and hints are currently locked by the host.")
+                return
+
+            return await func(interaction, *args, **kwargs)
+        return wrapper
+    return deco
+
 # Base Format Layers
 
 
@@ -448,18 +486,20 @@ async def signup_join(
 ):
     # 1) Channel restriction (allow the channel or its thread)
     ch = interaction.channel
-    in_allowed = (
-        interaction.channel_id == ALLOWED_SIGNUP_CHANNEL_ID
-        or getattr(ch, "parent_id", None) == ALLOWED_SIGNUP_CHANNEL_ID
-    )
-    if not in_allowed:
-        await interaction.response.send_message(
-            f"❌ You can only use this command in <#{ALLOWED_SIGNUP_CHANNEL_ID}>.",
-            ephemeral=True
+    if ALLOWED_SIGNUP_CHANNEL_ID is not None:
+        in_allowed = (
+            interaction.channel_id == ALLOWED_SIGNUP_CHANNEL_ID
+            or getattr(ch, "parent_id", None) == ALLOWED_SIGNUP_CHANNEL_ID
         )
-        return
-
-    await interaction.response.defer()
+        if not in_allowed:
+            await interaction.response.send_message(
+                f"❌ You can only use this command in <#{ALLOWED_SIGNUP_CHANNEL_ID}>.",
+                ephemeral=True
+            )
+            return
+    # We’re in an allowed place (or no env set) → defer publicly
+    if not interaction.response.is_done():
+        await interaction.response.defer()  # public
 
     # 2) Collections & capacity check
     players_db = db_client.players
@@ -1082,9 +1122,8 @@ def _portfolio_totals(items_cfg: dict, portfolio: dict) -> tuple[int, int]:
     name="view",
     description="View current market items (A–H)."
 )
+@guard(require_private=True, public=True)
 async def market_view(interaction: Interaction):
-    await interaction.response.defer(ephemeral=True)
-
     cfg = await _get_market_config()
     if not cfg or "items" not in cfg:
         await interaction.followup.send("❌ Market is not configured yet.")
@@ -1109,13 +1148,10 @@ async def market_view(interaction: Interaction):
         )
     )
 
-# ---------- Personal portfolio (ephemeral) ----------
-@market_cmd.subcommand(
-    name="inv",
-    description="View your portfolio: Unspent Cash, Total Cash, and your holdings."
-)
+# ---------- Personal Inventory ----------
+@market_cmd.subcommand(name="inv", description="View your own Inventory.")
+@guard(require_private=True, public=True)
 async def market_portfolio(interaction: Interaction):
-    await interaction.response.defer(ephemeral=False)
 
     cfg = await _get_market_config()
     if not cfg or "items" not in cfg:
@@ -1126,7 +1162,7 @@ async def market_portfolio(interaction: Interaction):
     uid = str(interaction.user.id)
     pf = await db_client.market.portfolios.find_one({"_id": uid})
     if not pf:
-        await interaction.followup.send("❌ No portfolio. Use **/signup join** first.")
+        await interaction.followup.send("❌ No Inventory. Use **/signup join** first.")
         return
 
     use_next = await _use_next_prices_flag()
@@ -1170,21 +1206,12 @@ async def market_portfolio(interaction: Interaction):
         colour=BOT_COLOUR
     ))
 
-# ---------- Owner-only: inspect someone else’s portfolio ----------
-@market_cmd.subcommand(
-    name="admin_inv",
-    description="OWNER: View someone else's portfolio."
-)
+# ---------- Owner-only: inspect someone else’s Inventory ----------
+@market_cmd.subcommand(name="admin_inv", description="OWNER: View the inventory of a certain user.")
+@guard(require_private=True, public=True, owner_only=True)
 async def market_admin_view(
-    interaction: Interaction,
-    user: Member = SlashOption(description="User to view", required=True)
-):
-    if interaction.user.id != OWNER_ID:
-        await interaction.response.defer(ephemeral=True)
-        await interaction.followup.send("❌ Only the owner can run this command.")
-        return
-
-    await interaction.response.defer(ephemeral=False)
+interaction: Interaction,
+    user: Member = SlashOption(description="User to view", required=True)):
 
     cfg = await _get_market_config()
     if not cfg or "items" not in cfg:
@@ -1195,7 +1222,7 @@ async def market_admin_view(
     uid = str(user.id)
     pf = await db_client.market.portfolios.find_one({"_id": uid})
     if not pf:
-        await interaction.followup.send("❌ No portfolio for that user.")
+        await interaction.followup.send("❌ No Inventory for that user.")
         return
 
     use_next = await _use_next_prices_flag()
@@ -1240,10 +1267,8 @@ async def market_admin_view(
     ))
 
 # ---------- Buy: spend Unspent Cash to increase holdings ----------
-@market_cmd.subcommand(
-    name="buy",
-    description="Buy items. Multiple pairs allowed (e.g., 'A 10, Apple 3')."
-)
+@market_cmd.subcommand(name="buy", description="Buy items. Multiple pairs allowed (e.g., 'A 10, Apple 3').")
+@guard(require_private=True, public=True, require_unlocked=True)
 async def market_purchase(
     interaction: Interaction,
     orders: str = SlashOption(
@@ -1251,9 +1276,6 @@ async def market_purchase(
         required=True
     ),
 ):
-    """Ephemeral: parse pairs; ensure no debt; enforce per-item cap; update portfolio."""
-    await interaction.response.defer(ephemeral=False)
-
     cfg = await _get_market_config()
     if not cfg or "items" not in cfg:
         await interaction.followup.send("❌ Market is not configured yet.")
@@ -1266,12 +1288,6 @@ async def market_purchase(
     if not pf:
         await interaction.followup.send("❌ No portfolio. Use **/signup join** first.")
         return
-
-    # Global interaction grant (trading lock) guard
-    if await _trading_locked():
-        await interaction.followup.send("❌ Trading is temporarily locked by the host.")
-        return
-
     # Parse "(item, qty)" pairs
     try:
         pairs = _parse_orders(orders)
@@ -1320,11 +1336,9 @@ async def market_purchase(
         f"\n**Unspent Cash**: {unspent}\n**Total Cash**: {total}"
     )
 
-# ============= Subcommand "admin_purchase" of "market" =============
-@market_cmd.subcommand(
-    name="admin_purchase",
-    description="OWNER: Purchase items for a player (same rules, no debt)."
-)
+# ============= Subcommand "admin_buy" of "market" =============
+@market_cmd.subcommand(name="admin_buy", description="OWNER: Purchase items for a player.")
+@guard(require_private=True, public=True, require_unlocked=True, owner_only=True)
 async def market_admin_purchase(
     interaction: Interaction,
     user: Member = SlashOption(description="Player to purchase for", required=True),
@@ -1333,33 +1347,12 @@ async def market_admin_purchase(
         required=True
     ),
 ):
-    # Owner check
-    if interaction.user.id != OWNER_ID:
-        await interaction.response.defer(ephemeral=True)
-        await interaction.followup.send("❌ Owner only.")
-        return
-
-    await interaction.response.defer(ephemeral=False)
-
-    # Global lock (shared with trading & hints)
-    if await _trading_locked():
-        await interaction.followup.send("❌ Trading is temporarily locked by the host.")
-        return
-
     # Load config (and optional private category gate)
     cfg = await _get_market_config()
     if not cfg or "items" not in cfg:
         await interaction.followup.send("❌ Market is not configured yet.")
         return
     items = cfg["items"]
-
-    private_cat_id = (cfg or {}).get("private_category_id")
-    ch_cat_id = getattr(getattr(interaction.channel, "category", None), "id", None)
-    if private_cat_id is not None and ch_cat_id != private_cat_id:
-        await interaction.followup.send(
-            "❌ Admin purchase is only allowed in channels under the private category."
-        )
-        return
 
     # Load target portfolio
     uid = str(user.id)
@@ -1431,12 +1424,9 @@ async def market_admin_purchase(
         f"✅ Purchased for {user.mention}:\n- " + "\n- ".join(lines) +
         f"\n**Remaining Unspent Cash**: {cash}"
     )
-
 # ---------- Sell: convert holdings back to Unspent Cash ----------
-@market_cmd.subcommand(
-    name="sell",
-    description="Sell items. Multiple pairs allowed; partial sell allowed."
-)
+@market_cmd.subcommand(name="sell",description="Sell items. Multiple pairs allowed; partial sell allowed.")
+@guard(require_private=True, public=True, require_unlocked=True)
 async def market_sell(
     interaction: Interaction,
     orders: str = SlashOption(
@@ -1444,9 +1434,6 @@ async def market_sell(
         required=True
     ),
 ):
-    """Ephemeral: sell up to held quantity; refund goes into Unspent Cash."""
-    await interaction.response.defer(ephemeral=False)
-
     cfg = await _get_market_config()
     if not cfg or "items" not in cfg:
         await interaction.followup.send("❌ Market is not configured yet.")
@@ -1458,11 +1445,6 @@ async def market_sell(
     pf = await pf_col.find_one({"_id": uid})
     if not pf:
         await interaction.followup.send("❌ No portfolio. Use **/signup join** first.")
-        return
-
-    # Global interaction grant (trading lock) guard
-    if await _trading_locked():
-        await interaction.followup.send("❌ Trading is temporarily locked by the host.")
         return
 
     # Parse "(item, qty)" pairs
@@ -1514,7 +1496,86 @@ async def market_sell(
     await interaction.followup.send(
         f"{summary}\n\n**Unspent Cash**: {unspent} (+{total_gain})\n**Total Cash**: {total}"
     )
+# ============= Subcommand "admin_sell" of "market" (Classic only) =============
+@market_cmd.subcommand(name="admin_sell",description="OWNER: Sell items from a player's holdings (refund at current price).")
+@guard(require_private=True, public=True, require_unlocked=True, owner_only=True)
+async def market_admin_sell(
+    interaction: Interaction,
+    user: Member = SlashOption(description="Player to sell for", required=True),
+    orders: str = SlashOption(
+        description="Pairs like 'A 10, C 5' or names 'Apple 3' (comma/|/; or newline separated).",
+        required=True
+    ),
+):
+    # Load config/items
+    cfg = await _get_market_config()
+    if not cfg or "items" not in cfg:
+        await interaction.followup.send("❌ Market is not configured yet.")
+        return
+    items = cfg["items"]
 
+    # Load target portfolio
+    uid = str(user.id)
+    pf_col = db_client.market.portfolios
+    pf = await pf_col.find_one({"_id": uid})
+    if not pf:
+        await interaction.followup.send(f"❌ {user.mention} has no portfolio. They must **/signup join** first.")
+        return
+
+    # Parse orders
+    try:
+        pairs = _parse_admin_orders(orders)   # re-use the helper from admin_purchase
+    except ValueError as e:
+        await interaction.followup.send(f"❌ {e}")
+        return
+
+    holdings = dict(pf.get("holdings") or {})
+    cash = int(pf.get("cash", 0))
+
+    # Build sell plan (partial allowed: sell up to owned; zero owned → skip with note)
+    proceeds = 0
+    sold: dict[str, int] = {}
+    skipped: list[str] = []
+
+    for ident, req_qty in pairs:
+        code = _resolve_item_code(items, ident)
+        if not code:
+            await interaction.followup.send(f"❌ Unknown item: `{ident}`")
+            return
+        if req_qty <= 0:
+            await interaction.followup.send("❌ Quantities must be positive integers.")
+            return
+
+        owned = int(holdings.get(code, 0))
+        if owned <= 0:
+            skipped.append(f"{code} — {items[code]['name']}: none owned")
+            continue
+
+        sell_qty = req_qty if req_qty <= owned else owned  # partial sell if not enough
+        price = int(items[code]["price"])                   # Classic: current price
+        proceeds += sell_qty * price
+        holdings[code] = owned - sell_qty
+        sold[code] = sold.get(code, 0) + sell_qty
+
+    if not sold and skipped:
+        await interaction.followup.send("ℹ️ Nothing sold: " + "; ".join(skipped))
+        return
+
+    cash += proceeds
+    await pf_col.update_one(
+        {"_id": uid},
+        {"$set": {"holdings": holdings, "cash": cash, "updated_at": _now_ts()}},
+        upsert=True
+    )
+
+    # Receipt (public)
+    lines = [f"{code} — {items[code]['name']}: -{qty} @ {items[code]['price']} = {items[code]['price']*qty}"
+             for code, qty in sold.items()]
+    extra = ("\n\nSkipped: " + "; ".join(skipped)) if skipped else ""
+    await interaction.followup.send(
+        f"✅ Sold for {user.mention}:\n- " + "\n- ".join(lines) +
+        f"\n**Unspent Cash**: {cash}{extra}"
+    )
 # ---------- Lock: Admin only command to temporarily lock purchases & Hint Point usage. ----------
 @market_cmd.subcommand(
     name="lock_trading",
@@ -1681,8 +1742,7 @@ async def stock_change_view(
         )
     )
 
-
-# ---------- /stock_change odds (kept; modernized message) ----------
+# ---------- /stock_change odds ----------
 @stock_change_cmd.subcommand(
     name="odds",
     description="Owner: compute odds from historical changes."
@@ -1855,10 +1915,8 @@ def calculate_odds(years: list):
             stock_odds[stock] = max(min(stock_odds[stock], 100), 0)
     return stock_odds
 #===================================================
-@use_hint.subcommand(
-    name="r",
-    description="Reveal odds of all stocks. Costs 1 HP.",
-)
+@use_hint.subcommand(name="r",description="Reveal odds of all stocks. Costs 1 HP.",)
+@guard(require_private=True, public=True, require_unlocked=True)
 async def r_hint(
         interaction: Interaction,
         confirm: str = SlashOption(
@@ -1937,10 +1995,8 @@ async def r_hint(
 
     await interaction.followup.send("Used R-hint!\n\n" + "\n".join(odd_lines),embed=balance_embed,view=balance_view,)
 #===================================================
-@use_hint.subcommand(
-    name="lvl1",
-    description="Reveals the strength of change for a single stock. Costs 1 HP.",
-)
+@use_hint.subcommand(name="lvl1",description="Reveals the strength of change for a single stock. Costs 1 HP.",)
+@guard(require_private=True, public=True, require_unlocked=True)
 async def lvl1_hint(
         interaction: Interaction,
         stock: str = SlashOption(
@@ -2029,10 +2085,8 @@ async def lvl1_hint(
     balance_embed = format_balance_embed(balance_view)
     await interaction.followup.send(change_info, embed=balance_embed, view=balance_view)
 #===================================================
-@use_hint.subcommand(
-    name="lvl2",
-    description="Gives 2 possible changes for a stock. Costs 2 HP",
-)
+@use_hint.subcommand(name="lvl2",description="Gives 2 possible changes for a stock. Costs 2 HP",)
+@guard(require_private=True, public=True, require_unlocked=True)
 async def lvl2_hint(
         interaction: Interaction,
         stock: str = SlashOption(
@@ -2128,10 +2182,8 @@ async def lvl2_hint(
     balance_embed = format_balance_embed(balance_view)
     await interaction.followup.send(change_info, embed=balance_embed, view=balance_view)
 #===================================================
-@use_hint.subcommand(
-    name="lvl3",
-    description="Shows whether a stock will increase or decrease. Costs 3 HP",
-)
+@use_hint.subcommand(name="lvl3",description="Shows whether a stock will increase or decrease. Costs 3 HP",)
+@guard(require_private=True, public=True, require_unlocked=True)
 async def lvl3_hint(
         interaction: Interaction,
         stock: str = SlashOption(

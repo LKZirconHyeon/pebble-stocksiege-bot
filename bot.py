@@ -275,6 +275,60 @@ def fmt_pct2_signed(x: float) -> str:
     """Format with sign and 2 decimals, e.g., +12.34% / -0.50%."""
     return f"{x:+.2f}%"
 
+# --- Global trading lock helpers ---
+async def _trading_locked() -> bool:
+    """Return True if the host has globally locked trading."""
+    doc = await db_client.market.config.find_one({"_id": "current"}, {"trading_locked": 1})
+    return bool(doc and doc.get("trading_locked"))
+
+async def _set_trading_locked(flag: bool) -> None:
+    """Flip the global trading lock on/off."""
+    await db_client.market.config.update_one(
+        {"_id": "current"},
+        {"$set": {"trading_locked": bool(flag), "updated_at": int(datetime.now().timestamp())}},
+        upsert=True,
+    )
+
+def _parse_admin_orders(raw: str) -> list[tuple[str, int]]:
+    """
+    Parse an orders string into [(identifier, qty)].
+    Accepts separators: comma, semicolon, pipe, or newline.
+    Each chunk is '<ident> <qty>', where ident is A–H or a case-insensitive item name.
+    """
+    import re
+    if not raw or not raw.strip():
+        raise ValueError("Empty orders.")
+    chunks = re.split(r"[,\n;\|]+", raw)
+    out: list[tuple[str, int]] = []
+    pat = re.compile(r"^\s*(?P<ident>[A-Za-z ]{1,20})\s+(?P<qty>\d{1,9})\s*$")
+    for ch in chunks:
+        ch = ch.strip()
+        if not ch:
+            continue
+        m = pat.match(ch)
+        if not m:
+            raise ValueError(f"Invalid order syntax: '{ch}'")
+        ident = m.group("ident").strip()
+        qty = int(m.group("qty"))
+        out.append((ident, qty))
+    if not out:
+        raise ValueError("No valid orders found.")
+    return out
+
+def _resolve_item_code(items: dict, ident: str) -> str | None:
+    """
+    Convert 'A'..'H' or an item name to canonical code. Name match is case-insensitive.
+    """
+    ident = ident.strip()
+    up = ident.upper()
+    if up in ITEM_CODES:
+        return up
+    norm = " ".join(ident.split()).lower()
+    for code in ITEM_CODES:
+        nm = str(items.get(code, {}).get("name", "")).strip().lower()
+        if nm == norm:
+            return code
+    return None
 # Base Format Layers
 
 
@@ -728,6 +782,7 @@ async def signup_reset(
 
 
 
+#===================================================
 # ============= General "hint_points" Group of Commands
 @bot.slash_command(
     name="hint_points",
@@ -735,7 +790,7 @@ async def signup_reset(
     force_global=True)
 async def hint_points_cmd(interaction: Interaction):
     pass
-
+#===================================================
 # ============= Subcommand "add" of "hint_points"
 @hint_points_cmd.subcommand(
     description="Add hint_points.",
@@ -792,7 +847,7 @@ async def add(
         view=balance_view,
         allowed_mentions=AllowedMentions(everyone=False, roles=False, users=[user]),
     )
-
+#===================================================
 # ============= Subcommand "remove" of "hint_points"
 @hint_points_cmd.subcommand(
     description="Remove hint points.",
@@ -851,7 +906,7 @@ async def remove(
         view=balance_view,
         allowed_mentions=AllowedMentions(everyone=False, roles=False, users=[user]),
     )
-
+#===================================================
 # ============= Subcommand "view" of "hint_points"
 @hint_points_cmd.subcommand(
     name="view",
@@ -887,7 +942,7 @@ async def hint_points_view(
         embed=balance_embed,
         view=balance_view
     )
-
+#===================================================
 # ============= Subcommand "transfer" of "hint_points"
 @hint_points_cmd.subcommand(
     description="Transfer hint points to another person.",
@@ -965,7 +1020,7 @@ async def transfer(
         view=balance_view,
         allowed_mentions=AllowedMentions(everyone=False, roles=False, users=[user]),
     )
-
+#===================================================
 # ============= Subcommand "list" of "hint_points"
 @hint_points_cmd.subcommand(
     name="list",
@@ -997,6 +1052,7 @@ async def hint_points_list(
 
 
 
+#===================================================
 # ============= "market" Group of Commands =============
 @bot.slash_command(
     name="market",
@@ -1055,11 +1111,11 @@ async def market_view(interaction: Interaction):
 
 # ---------- Personal portfolio (ephemeral) ----------
 @market_cmd.subcommand(
-    name="portfolio",
+    name="inv",
     description="View your portfolio: Unspent Cash, Total Cash, and your holdings."
 )
 async def market_portfolio(interaction: Interaction):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
 
     cfg = await _get_market_config()
     if not cfg or "items" not in cfg:
@@ -1116,7 +1172,7 @@ async def market_portfolio(interaction: Interaction):
 
 # ---------- Owner-only: inspect someone else’s portfolio ----------
 @market_cmd.subcommand(
-    name="admin_view",
+    name="admin_inv",
     description="OWNER: View someone else's portfolio."
 )
 async def market_admin_view(
@@ -1128,7 +1184,7 @@ async def market_admin_view(
         await interaction.followup.send("❌ Only the owner can run this command.")
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
 
     cfg = await _get_market_config()
     if not cfg or "items" not in cfg:
@@ -1196,7 +1252,7 @@ async def market_purchase(
     ),
 ):
     """Ephemeral: parse pairs; ensure no debt; enforce per-item cap; update portfolio."""
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
 
     cfg = await _get_market_config()
     if not cfg or "items" not in cfg:
@@ -1209,6 +1265,11 @@ async def market_purchase(
     pf = await pf_col.find_one({"_id": uid})
     if not pf:
         await interaction.followup.send("❌ No portfolio. Use **/signup join** first.")
+        return
+
+    # Global interaction grant (trading lock) guard
+    if await _trading_locked():
+        await interaction.followup.send("❌ Trading is temporarily locked by the host.")
         return
 
     # Parse "(item, qty)" pairs
@@ -1259,6 +1320,118 @@ async def market_purchase(
         f"\n**Unspent Cash**: {unspent}\n**Total Cash**: {total}"
     )
 
+# ============= Subcommand "admin_purchase" of "market" =============
+@market_cmd.subcommand(
+    name="admin_purchase",
+    description="OWNER: Purchase items for a player (same rules, no debt)."
+)
+async def market_admin_purchase(
+    interaction: Interaction,
+    user: Member = SlashOption(description="Player to purchase for", required=True),
+    orders: str = SlashOption(
+        description="Pairs like 'A 10, C 5' or names 'Apple 3' (comma/|/; or newline separated).",
+        required=True
+    ),
+):
+    # Owner check
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.defer(ephemeral=True)
+        await interaction.followup.send("❌ Owner only.")
+        return
+
+    await interaction.response.defer(ephemeral=False)
+
+    # Global lock (shared with trading & hints)
+    if await _trading_locked():
+        await interaction.followup.send("❌ Trading is temporarily locked by the host.")
+        return
+
+    # Load config (and optional private category gate)
+    cfg = await _get_market_config()
+    if not cfg or "items" not in cfg:
+        await interaction.followup.send("❌ Market is not configured yet.")
+        return
+    items = cfg["items"]
+
+    private_cat_id = (cfg or {}).get("private_category_id")
+    ch_cat_id = getattr(getattr(interaction.channel, "category", None), "id", None)
+    if private_cat_id is not None and ch_cat_id != private_cat_id:
+        await interaction.followup.send(
+            "❌ Admin purchase is only allowed in channels under the private category."
+        )
+        return
+
+    # Load target portfolio
+    uid = str(user.id)
+    pf_col = db_client.market.portfolios
+    pf = await pf_col.find_one({"_id": uid})
+    if not pf:
+        await interaction.followup.send(
+            f"❌ {user.mention} has no portfolio. They must **/signup join** first."
+        )
+        return
+
+    # Parse orders → [(identifier, qty)]
+    try:
+        pairs = _parse_admin_orders(orders)
+    except ValueError as e:
+        await interaction.followup.send(f"❌ {e}")
+        return
+
+    # Resolve identifiers to item codes and validate; price at CURRENT price
+    adds: dict[str, int] = {}
+    total_cost = 0
+    holdings = dict(pf.get("holdings") or {})
+    cash = int(pf.get("cash", 0))
+
+    for ident, qty in pairs:
+        code = _resolve_item_code(items, ident)
+        if not code:
+            await interaction.followup.send(f"❌ Unknown item: `{ident}`")
+            return
+        if qty <= 0:
+            await interaction.followup.send("❌ Quantities must be positive integers.")
+            return
+
+        price = int(items[code]["price"])  # Classic: purchases use CURRENT price
+        cur_qty = int(holdings.get(code, 0))
+        if cur_qty + qty > MAX_ITEM_UNITS:
+            await interaction.followup.send(
+                f"❌ Holding limit exceeded for {code}. Max {MAX_ITEM_UNITS}."
+            )
+            return
+
+        adds[code] = adds.get(code, 0) + qty
+        total_cost += price * qty
+
+    # Debt restriction
+    if cash - total_cost < 0:
+        await interaction.followup.send(
+            f"❌ Not enough cash for {user.mention}. Needs {total_cost}, has {cash}."
+        )
+        return
+
+    # Apply
+    for code, qty in adds.items():
+        holdings[code] = int(holdings.get(code, 0)) + qty
+    cash -= total_cost
+
+    await pf_col.update_one(
+        {"_id": uid},
+        {"$set": {"holdings": holdings, "cash": cash, "updated_at": _now_ts()}},
+        upsert=True
+    )
+
+    # Receipt
+    lines = [
+        f"{code} — {items[code]['name']}: +{qty} @ {items[code]['price']} = {items[code]['price']*qty}"
+        for code, qty in adds.items()
+    ]
+    await interaction.followup.send(
+        f"✅ Purchased for {user.mention}:\n- " + "\n- ".join(lines) +
+        f"\n**Remaining Unspent Cash**: {cash}"
+    )
+
 # ---------- Sell: convert holdings back to Unspent Cash ----------
 @market_cmd.subcommand(
     name="sell",
@@ -1272,7 +1445,7 @@ async def market_sell(
     ),
 ):
     """Ephemeral: sell up to held quantity; refund goes into Unspent Cash."""
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
 
     cfg = await _get_market_config()
     if not cfg or "items" not in cfg:
@@ -1285,6 +1458,11 @@ async def market_sell(
     pf = await pf_col.find_one({"_id": uid})
     if not pf:
         await interaction.followup.send("❌ No portfolio. Use **/signup join** first.")
+        return
+
+    # Global interaction grant (trading lock) guard
+    if await _trading_locked():
+        await interaction.followup.send("❌ Trading is temporarily locked by the host.")
         return
 
     # Parse "(item, qty)" pairs
@@ -1336,6 +1514,44 @@ async def market_sell(
     await interaction.followup.send(
         f"{summary}\n\n**Unspent Cash**: {unspent} (+{total_gain})\n**Total Cash**: {total}"
     )
+
+# ---------- Lock: Admin only command to temporarily lock purchases & Hint Point usage. ----------
+@market_cmd.subcommand(
+    name="lock_trading",
+    description="OWNER: Temporarily lock all trading (buy/sell/admin purchase)."
+)
+async def market_lock_trading(interaction: Interaction):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.defer(ephemeral=True)
+        await interaction.followup.send("❌ Owner only.")
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    if await _trading_locked():
+        await interaction.followup.send("ℹ️ Trading and hints are already **locked**.")
+        return
+
+    await _set_trading_locked(True)
+    await interaction.followup.send("🔒 Trading and hints are now **locked**. Buying and selling are disabled.")
+
+@market_cmd.subcommand(
+    name="unlock_trading",
+    description="OWNER: Unlock trading."
+)
+async def market_unlock_trading(interaction: Interaction):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.defer(ephemeral=True)
+        await interaction.followup.send("❌ Owner only.")
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    if not await _trading_locked():
+        await interaction.followup.send("ℹ️ Trading and hints are already **unlocked**.")
+        return
+
+    await _set_trading_locked(False)
+    await interaction.followup.send("🔓 Trading and hints are now **unlocked**.")
+
 
 
 
@@ -1616,8 +1832,8 @@ async def stock_change_liquidate(
 
 
 
-
-# Hint Point System
+#===================================================
+# ============= General "use_hint" Group of Commands
 @bot.slash_command(
     name="use_hint",
     description="Use your hint points",
@@ -1638,7 +1854,7 @@ def calculate_odds(years: list):
             stock_odds[stock] += ODDS[change]
             stock_odds[stock] = max(min(stock_odds[stock], 100), 0)
     return stock_odds
-
+#===================================================
 @use_hint.subcommand(
     name="r",
     description="Reveal odds of all stocks. Costs 1 HP.",
@@ -1653,6 +1869,11 @@ async def r_hint(
     await interaction.response.defer()
     if confirm != "R HINT":
         await interaction.followup.send("Command rejected. Put ``R HINT`` in the ``confirm`` option to use an r hint.")
+        return
+    
+    # Global lock guard (shared with trading)
+    if await _trading_locked():
+        await interaction.followup.send("❌ Hint usage is temporarily locked by the host.")
         return
 
     # Load user's hint bank
@@ -1715,7 +1936,7 @@ async def r_hint(
     balance_embed = format_balance_embed(balance_view)
 
     await interaction.followup.send("Used R-hint!\n\n" + "\n".join(odd_lines),embed=balance_embed,view=balance_view,)
-
+#===================================================
 @use_hint.subcommand(
     name="lvl1",
     description="Reveals the strength of change for a single stock. Costs 1 HP.",
@@ -1735,6 +1956,11 @@ async def lvl1_hint(
     await interaction.response.defer()
     if confirm != "LVL1":
         await interaction.followup.send("Command rejected. Put ``LVL1`` in the ``confirm`` option to use a hint.")
+        return
+    
+    # Global lock guard (shared with trading)
+    if await _trading_locked():
+        await interaction.followup.send("❌ Hint usage is temporarily locked by the host.")
         return
 
     # Bank lookup
@@ -1802,7 +2028,7 @@ async def lvl1_hint(
     balance_view = BankBalanceViewer(0, hint_bank["balance"], history, interaction.user)
     balance_embed = format_balance_embed(balance_view)
     await interaction.followup.send(change_info, embed=balance_embed, view=balance_view)
-
+#===================================================
 @use_hint.subcommand(
     name="lvl2",
     description="Gives 2 possible changes for a stock. Costs 2 HP",
@@ -1822,6 +2048,11 @@ async def lvl2_hint(
     await interaction.response.defer()
     if confirm != "LVL2":
         await interaction.followup.send("Command rejected. Put ``LVL2`` in the ``confirm`` option to use a hint.")
+        return
+    
+    # Global lock guard (shared with trading)
+    if await _trading_locked():
+        await interaction.followup.send("❌ Hint usage is temporarily locked by the host.")
         return
 
     # Bank lookup
@@ -1896,7 +2127,7 @@ async def lvl2_hint(
     balance_view = BankBalanceViewer(0, hint_bank["balance"], history, interaction.user)
     balance_embed = format_balance_embed(balance_view)
     await interaction.followup.send(change_info, embed=balance_embed, view=balance_view)
-
+#===================================================
 @use_hint.subcommand(
     name="lvl3",
     description="Shows whether a stock will increase or decrease. Costs 3 HP",
@@ -1916,6 +2147,11 @@ async def lvl3_hint(
     await interaction.response.defer()
     if confirm != "LVL3":
         await interaction.followup.send("Command rejected. Put ``LVL3`` in the ``confirm`` option to use a hint.")
+        return
+    
+    # Global lock guard (shared with trading)
+    if await _trading_locked():
+        await interaction.followup.send("❌ Hint usage is temporarily locked by the host.")
         return
 
     # Bank lookup
@@ -1983,7 +2219,7 @@ async def lvl3_hint(
     balance_view = BankBalanceViewer(0, hint_bank["balance"], history, interaction.user)
     balance_embed = format_balance_embed(balance_view)
     await interaction.followup.send(change_info, embed=balance_embed, view=balance_view)
-
+#===================================================
 @bot.message_command(name="Get Unix timestamp")
 async def command_rac_time(interaction: Interaction, sent_message: Message):
     await interaction.response.defer()

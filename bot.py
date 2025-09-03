@@ -1,12 +1,13 @@
 from motor.motor_asyncio import AsyncIOMotorClient  # MongoDB library
 import nextcord  # Discord bot library
 from nextcord.ext import commands
-from nextcord import Interaction, SlashOption, ButtonStyle, Embed, Member, AllowedMentions, Colour, Message
-from nextcord.ui import View, Button
+from nextcord import Interaction, SlashOption, SelectOption, ButtonStyle, Embed, Member, AllowedMentions, Colour, Message
+from nextcord.ui import View, Button, Modal, TextInput, Select
 from datetime import datetime
 from dotenv import load_dotenv
 import os
 import re
+import copy
 
 load_dotenv()
 db_client = AsyncIOMotorClient(os.getenv("DB_URL"))  # put link to database, MongoDB has free cloud service
@@ -318,14 +319,19 @@ def _resolve_item_code(items: dict, ident: str) -> str | None:
     return None
 # ---------- Private Category + public defer helpers ----------
 def _in_game_category(inter: Interaction) -> bool:
-    """Return True if the command is run inside the allowed game category (or no env set)."""
     if ALLOWED_GAME_CATEGORY_ID is None:
         return True
-    cat = getattr(inter.channel, "category", None)
-    return getattr(cat, "id", None) == ALLOWED_GAME_CATEGORY_ID
+    ch = inter.channel
+    # direct category (normal text channel)
+    cat = getattr(ch, "category", None)
+    if getattr(cat, "id", None) == ALLOWED_GAME_CATEGORY_ID:
+        return True
+    # thread → check parent channel's category
+    parent = getattr(ch, "parent", None)
+    pcat = getattr(parent, "category", None)
+    return getattr(pcat, "id", None) == ALLOWED_GAME_CATEGORY_ID
 
 from functools import wraps
-
 def guard(*, require_private: bool, public: bool, require_unlocked: bool = False, owner_only: bool = False):
     """
     Unified gate for commands:
@@ -367,6 +373,88 @@ def guard(*, require_private: bool, public: bool, require_unlocked: bool = False
         return wrapper
     return deco
 
+# ===================== Snapshots (for Revert) =====================
+
+def _snap_col():
+    return db_client.market.snapshots
+
+async def _snapshot_state_for_liquidate(result_year: int) -> str:
+    """Save a full restore point BEFORE we liquidate portfolios."""
+    cfg = await db_client.market.config.find_one({"_id": "current"}) or {}
+    portfolios = []
+    async for pf in db_client.market.portfolios.find({}):
+        portfolios.append({
+            "_id": pf["_id"],
+            "cash": int(pf.get("cash", 0)),
+            "holdings": copy.deepcopy(pf.get("holdings", {})),
+            # keep any flags you already use; harmless if absent
+            "elim_locked": bool(pf.get("elim_locked", False)),
+            "elim_locked_at_year": pf.get("elim_locked_at_year"),
+            "global_locked": bool(pf.get("global_locked", False)),
+        })
+    doc = {
+        "type": "liquidate",
+        "result_year": int(result_year),
+        "created_at": _now_ts(),
+        "config": cfg,
+        "portfolios": portfolios,
+    }
+    res = await _snap_col().insert_one(doc)
+    return str(res.inserted_id)
+
+async def _purge_snapshots(keep_last: int = 0) -> int:
+    """
+    Delete older liquidation snapshots.
+    keep_last=1 -> keep only newest; keep_last=0 -> delete all.
+    Returns number of deleted documents.
+    """
+    cur = _snap_col().find({"type": "liquidate"}).sort("created_at", -1).skip(max(keep_last, 0))
+    ids = [doc["_id"] async for doc in cur]
+    if not ids:
+        return 0
+    res = await _snap_col().delete_many({"_id": {"$in": ids}})
+    return int(res.deleted_count)
+
+# ===================== Pre-reveal snapshots (per year) =====================
+async def _snapshot_pre_reveal(year: int) -> str:
+    """
+    Save all portfolios *before* revealing new prices for `year`.
+    Use for targeted per-user rollback.
+    """
+    portfolios = []
+    async for pf in db_client.market.portfolios.find({}):
+        portfolios.append({
+            "_id": pf["_id"],
+            "cash": int(pf.get("cash", 0)),
+            "holdings": copy.deepcopy(pf.get("holdings", {})),
+            "updated_at": _now_ts(),
+        })
+    doc = {
+        "type": "pre_reveal",
+        "year": int(year),
+        "created_at": _now_ts(),
+        "portfolios": portfolios,
+    }
+    res = await _snap_col().insert_one(doc)
+    return str(res.inserted_id)
+
+# --- signup settings helpers
+def _signup_cfg_col():
+    return db_client.players.signup_settings  # single doc store
+
+async def _get_signup_settings() -> dict:
+    doc = await _signup_cfg_col().find_one({"_id": "current"})
+    if not doc:
+        doc = {"_id": "current", "started": False, "locked_at": None}
+        await _signup_cfg_col().insert_one(doc)
+    return doc
+
+async def _set_game_started(started: bool) -> None:
+    await _signup_cfg_col().update_one(
+        {"_id": "current"},
+        {"$set": {"started": bool(started), "locked_at": _now_ts() if started else None}},
+        upsert=True
+    )
 # Base Format Layers
 
 
@@ -453,6 +541,7 @@ def paginate_list(array: list, entries_per_page: int = None):
     if ten_array:
         newer_array.append(ten_array)
     return newer_array
+
 # Base Class Layers
 
 
@@ -645,7 +734,7 @@ async def signup_reset(
             required=True
         ),
 ):
-    # 권한
+    # Permission
     if interaction.user.id != OWNER_ID:
         await interaction.response.defer(ephemeral=True)
         await interaction.followup.send("❌ Only the owner can run this command.")
@@ -653,12 +742,12 @@ async def signup_reset(
 
     await interaction.response.defer(ephemeral=True)
 
-    # 0) 1차 안전장치
+    # Primary Safety
     if confirm != "CONFIRM":
         await interaction.followup.send("❌ Type `CONFIRM` to prepare reset preview.")
         return
 
-    # 1) 입력 파싱/검증
+    # Input Parsing
     name_list = [s.strip() for s in names.split("|")]
     price_list = [s.strip() for s in prices.split("|")]
     if len(name_list) != 8 or len(price_list) != 8:
@@ -680,12 +769,12 @@ async def signup_reset(
         await interaction.followup.send("❌ All prices must be positive integers.")
         return
 
-    # 2) 미리보기 데이터 구성
+    # Preview Data Structuring
     new_items = {code: {"name": name_list[i], "price": price_vals[i]} for i, code in enumerate(ITEM_CODES)}
     preview_lines = [f"{code}: **{new_items[code]['name']}** — {new_items[code]['price']}" for code in ITEM_CODES]
     preview = "\n".join(preview_lines)
 
-    # 3) 확인용 View 정의
+    # Creating View for confirm
     class ResetConfirmView(View):
         def __init__(self, owner_id: int, items: dict):
             super().__init__(timeout=600)
@@ -694,7 +783,7 @@ async def signup_reset(
             self.message = None
 
         async def interaction_check(self, btn_inter: Interaction) -> bool:
-            # 오너만 버튼 클릭 가능
+            # Owner Only
             if btn_inter.user.id != self.owner_id:
                 await btn_inter.response.send_message("❌ Only the owner can confirm/cancel this.", ephemeral=True)
                 return False
@@ -725,6 +814,7 @@ async def signup_reset(
                 cres = await db_client.stocks.changes.delete_many({})
                 try:
                     await db_client.stocks.prices.delete_many({})
+                    await db_client.market.snapshots.delete_many({})
                 except Exception:
                     pass  # collection may not exist
             except Exception as e:
@@ -757,7 +847,7 @@ async def signup_reset(
                     },
                     upsert=True
                 )
-
+                await _set_game_started(False)
                 # Build preview text
                 preview_lines = [
                     f"{c}: **{clean_items[c]['name']}** — {clean_items[c]['price']}"
@@ -785,7 +875,7 @@ async def signup_reset(
                     content=f"❌ Error while writing new market config: {e}", view=None
                 )
 
-    # Cancel 버튼
+    # Cancel Button
     class CancelButton(Button):
         def __init__(self):
             super().__init__(style=ButtonStyle.secondary, label="Cancel", emoji="🚫")
@@ -817,6 +907,209 @@ async def signup_reset(
 
     msg = await interaction.followup.send(embed=embed, view=view)
     view.message = msg
+# make sure these are imported near the top of your file:
+# from nextcord.ui import View, Button, Modal, TextInput, Select
+# from nextcord import SelectOption
+
+@signup_cmd.subcommand(
+    name="config",
+    description="Open the signup panel (self-config + admin tools)."
+)
+async def signup_config(interaction: Interaction):
+    await interaction.response.defer()  # ✅ ensure the first response exists (public)
+
+    players_db = db_client.players
+    signups_col = players_db.signups
+
+    user_id = str(interaction.user.id)
+    signup_doc = await signups_col.find_one({"_id": user_id})
+    settings = await _get_signup_settings()
+
+    cur_count = await signups_col.count_documents({})
+    slots_left = max(0, MAX_PLAYERS - cur_count)
+    locked = bool(settings.get("started"))
+
+    if signup_doc:
+        summary = (f"**You are signed up.**\n"
+                   f"Name: **{signup_doc['color_name']}**  •  HEX: `{signup_doc['color_hex']}`")
+    else:
+        summary = "You have **not** signed up yet. Use **/signup join** in the signup channel."
+
+    lock_line = "🔒 **Game Started** — signups & edits are locked." if locked else "🟢 Signups are **open**."
+    slots_line = f"**Slots:** {cur_count} / {MAX_PLAYERS}" + (f"  •  ({slots_left} left)" if not locked else "")
+
+    embed = Embed(
+        title="Signup — Configuration",
+        description=f"{lock_line}\n{slots_line}\n\n{summary}",
+        colour=BOT_COLOUR
+    )
+
+    class SignupPanel(View):
+        def __init__(self, owner_id: int, started: bool, user_has_signup: bool,
+                     cur_count: int, slots_left: int):
+            super().__init__(timeout=600)
+            self.owner_id = owner_id
+            self.started = started
+            self.user_has_signup = user_has_signup
+            self.cur_count = cur_count
+            self.slots_left = slots_left
+
+            join_btn = Button(style=ButtonStyle.primary, label="How do I sign up?")
+            join_btn.callback = self.on_join_help
+            join_btn.disabled = self.started
+            self.add_item(join_btn)
+
+            edit_btn = Button(style=ButtonStyle.secondary, label="Edit My Color/HEX", emoji="🎨")
+            edit_btn.callback = self.on_edit
+            edit_btn.disabled = not (self.user_has_signup and not self.started)
+            self.add_item(edit_btn)
+
+            rem_btn = Button(style=ButtonStyle.danger, label="Remove Player (Owner)", emoji="🗑️")
+            rem_btn.callback = self.on_admin_remove
+            rem_btn.disabled = (interaction.user.id != OWNER_ID)
+            self.add_item(rem_btn)
+
+            can_start = (not self.started) and (self.cur_count >= MAX_PLAYERS)
+            gs_label = "Start Game (Lock Signups)" if not self.started else "Unlock Signups"
+            gs_emoji = "🚀" if not self.started else "🔓"
+            start_btn = Button(style=ButtonStyle.success if not self.started else ButtonStyle.secondary,
+                               label=gs_label, emoji=gs_emoji)
+            start_btn.callback = self.on_toggle_start
+            start_btn.disabled = (interaction.user.id != OWNER_ID) or (not self.started and not can_start)
+            self.add_item(start_btn)
+
+        async def on_join_help(self, btn_inter: Interaction):
+            await btn_inter.response.send_message(
+                "Use **/signup join** in the designated signup channel to register.\n"
+                "You’ll choose your color name and HEX; capacity is limited.",
+                ephemeral=True
+            )
+
+        async def on_edit(self, btn_inter: Interaction):
+            if self.started or not self.user_has_signup:
+                await btn_inter.response.send_message("❌ Editing is locked.", ephemeral=True)
+                return
+
+            class EditModal(Modal):
+                def __init__(self):
+                    super().__init__("Edit Color / HEX")
+            
+                    self.color_name = TextInput(
+                        label="Color Name (letters & spaces, 1~20)",
+                        required=True,
+                        max_length=20,
+                        # style=TextInputStyle.short,  # optional
+                        default_value=signup_doc["color_name"],   # ← was `default=...`
+                    )
+                    self.color_hex = TextInput(
+                        label="HEX (e.g., #FF00AA or FF00AA)",
+                        required=True,
+                        # style=TextInputStyle.short,  # optional
+                        default_value=signup_doc["color_hex"],    # ← was `default=...`
+                    )
+            
+                    self.add_item(self.color_name)
+                    self.add_item(self.color_hex)
+            
+                async def callback(self, modal_inter: Interaction):
+                    name = self.color_name.value.strip()
+                    hexv = self.color_hex.value.strip()
+            
+                    if not COLOR_NAME_RE.fullmatch(name):
+                        await modal_inter.response.send_message(
+                            "❌ Invalid color name. Use only English letters and spaces, up to 20 characters.",
+                            ephemeral=True
+                        )
+                        return
+            
+                    norm = _normalize_hex(hexv)
+                    if norm is None:
+                        await modal_inter.response.send_message(
+                            "❌ Invalid HEX code. Provide a 6-digit HEX like `#RRGGBB`.",
+                            ephemeral=True
+                        )
+                        return
+            
+                    await signups_col.update_one(
+                        {"_id": user_id},
+                        {"$set": {"color_name": name, "color_hex": norm,
+                                  "signup_time": signup_doc.get("signup_time")}}
+                    )
+                    await modal_inter.response.send_message(
+                        f"✅ Updated: **{name}** `{norm}`", ephemeral=True
+                    )
+
+            await btn_inter.response.send_modal(EditModal())
+
+        async def on_toggle_start(self, btn_inter: Interaction):
+            if btn_inter.user.id != self.owner_id:
+                await btn_inter.response.send_message("❌ Owner only.", ephemeral=True)
+                return
+
+            live_count = await signups_col.count_documents({})
+            if not self.started and live_count < MAX_PLAYERS:
+                await btn_inter.response.send_message(
+                    f"⏳ Need a full roster to start: {live_count}/{MAX_PLAYERS}.",
+                    ephemeral=True
+                )
+                return
+
+            new_state = not self.started
+            await _set_game_started(new_state)
+            self.started = new_state
+
+            live_left = max(0, MAX_PLAYERS - live_count)
+            lock_line = "🔒 **Game Started** — signups & edits are locked." if new_state else "🟢 Signups are **open**."
+            slots_line = f"**Slots:** {live_count} / {MAX_PLAYERS}" + (f"  •  ({live_left} left)" if not new_state else "")
+            new_view = SignupPanel(self.owner_id, self.started, self.user_has_signup, live_count, live_left)
+            await btn_inter.response.edit_message(
+                embed=Embed(
+                    title="Signup — Configuration",
+                    description=f"{lock_line}\n{slots_line}\n\n{summary}",
+                    colour=BOT_COLOUR
+                ),
+                view=new_view
+            )
+
+        async def on_admin_remove(self, btn_inter: Interaction):
+            if btn_inter.user.id != self.owner_id:
+                await btn_inter.response.send_message("❌ Owner only.", ephemeral=True)
+                return
+            if self.started:
+                await btn_inter.response.send_message("🔒 Locked. Unlock first to remove.", ephemeral=True)
+                return
+
+            options = []
+            async for s in signups_col.find({}, {"_id": 1, "user_name": 1, "color_name": 1}):
+                label = f"{s.get('user_name','(unknown)')} — {s.get('color_name','')}"
+                options.append(SelectOption(label=label[:100], value=s["_id"]))
+            if not options:
+                await btn_inter.response.send_message("No one has signed up.", ephemeral=True)
+                return
+
+            select = Select(placeholder="Choose a player to remove…", min_values=1, max_values=1, options=options)
+
+            async def on_select(select_inter: Interaction):
+                target_uid = select.values[0]  # ✅ read value from the Select component
+                deleted = 0
+                deleted += (await signups_col.delete_one({"_id": target_uid})).deleted_count
+                deleted += (await db_client.hint_points.balance.delete_one({"_id": target_uid})).deleted_count
+                deleted += (await db_client.market.portfolios.delete_one({"_id": target_uid})).deleted_count
+                await select_inter.response.edit_message(
+                    content=f"✅ Removed `<@{target_uid}>` (deleted docs total: {deleted}).",
+                    view=None
+                )
+
+            select.callback = on_select
+            v = View(timeout=300)
+            v.add_item(select)
+            await btn_inter.response.send_message("Select a player to remove:", view=v, ephemeral=True)
+
+    # we already deferred; now follow-up is valid
+    await interaction.followup.send(
+        embed=embed,
+        view=SignupPanel(OWNER_ID, locked, signup_doc is not None, cur_count, slots_left)
+    )
 
 
 
@@ -1152,54 +1445,66 @@ async def market_view(interaction: Interaction):
 @market_cmd.subcommand(name="inv", description="View your own Inventory.")
 @guard(require_private=True, public=True)
 async def market_portfolio(interaction: Interaction):
-
+    # Load config & items
     cfg = await _get_market_config()
     if not cfg or "items" not in cfg:
         await interaction.followup.send("❌ Market is not configured yet.")
         return
     items = cfg["items"]
 
+    # Load portfolio
     uid = str(interaction.user.id)
     pf = await db_client.market.portfolios.find_one({"_id": uid})
     if not pf:
         await interaction.followup.send("❌ No Inventory. Use **/signup join** first.")
         return
 
-    use_next = await _use_next_prices_flag()
-    # Always compute both baselines
-    _, total_current = _portfolio_totals_with_mode(items, pf, use_next=False)
+    # Decide pricing mode (respect freeze)
+    global_use_next = bool(cfg.get("use_next_for_total"))
+    next_year = int(cfg.get("next_year")) if cfg.get("next_year") is not None else None
+    use_next = global_use_next
+    frozen_note = False
+    if global_use_next and next_year is not None and pf.get("frozen_year") == next_year:
+        # Quarantined for this NEXT result → value at current prices
+        use_next = False
+        frozen_note = True
+
+    # Baselines
+    _, total_current = _portfolio_totals_with_mode(items, pf, use_next=False)  # always current
     unspent, total_shown = _portfolio_totals_with_mode(items, pf, use_next=use_next)
 
-    # holdings list (keep; uses the same pricing mode)
+    # Holdings list (valued in the chosen mode)
+    holdings = pf.get("holdings", {}) or {}
     holdings_lines = []
     for code in ITEM_CODES:
-        qty = int(pf["holdings"].get(code, 0))
-        if qty > 0:
-            base = int(items[code]["price"])
-            p = int(items[code].get("next_price", base)) if use_next else base
-            value = qty * p
-            holdings_lines.append(f"{code} - {items[code]['name']}: {qty} (≈ {value})")
+        qty = int(holdings.get(code, 0))
+        if qty <= 0:
+            continue
+        base = int(items[code]["price"])
+        p = int(items[code].get("next_price", base)) if use_next else base
+        value = qty * p
+        holdings_lines.append(f"{code} - {items[code]['name']}: {qty} (≈ {value})")
 
-    unspent = int(pf["cash"])
-    valuation = _holdings_valuation(items, pf, use_next)  # <-- value of holdings at chosen mode
-    total_cash = unspent + valuation                   # <-- the rule you want
-
+    # 2-decimal change vs current when NEXT is shown
     change_line = ""
     if use_next:
         if total_current > 0:
-            pct = (total_cash / total_current - 1.0) * 100.0
+            pct = (total_shown / total_current - 1.0) * 100.0
             change_line = f"\n**Change vs current:** {fmt_pct2_signed(pct)}"
         else:
             change_line = "\n**Change vs current:** N/A"
 
+    # Description
     mode_label = "NEXT-year prices" if use_next else "current prices"
+    frozen_line = f"\n_Valuation uses **CURRENT** prices (frozen for Y{next_year})._" if frozen_note else ""
     desc = (
-        f"_Valuation uses {mode_label}_\n\n"
+        f"_Valuation uses {mode_label}_{frozen_line}\n\n"
         f"**Unspent Cash**: {unspent}\n"
-        f"**Total Cash**: {total_cash}"
+        f"**Total Cash**: {total_shown}"
         f"{change_line}\n\n"
         + ("**Holdings**\n" + "\n".join(holdings_lines) if holdings_lines else "_No holdings_")
     )
+
     await interaction.followup.send(embed=Embed(
         title=f"Portfolio — {interaction.user.display_name}",
         description=desc,
@@ -1210,56 +1515,69 @@ async def market_portfolio(interaction: Interaction):
 @market_cmd.subcommand(name="admin_inv", description="OWNER: View the inventory of a certain user.")
 @guard(require_private=True, public=True, owner_only=True)
 async def market_admin_view(
-interaction: Interaction,
-    user: Member = SlashOption(description="User to view", required=True)):
-
+    interaction: Interaction,
+    user: Member = SlashOption(description="User to view", required=True)
+):
+    # Load config & items
     cfg = await _get_market_config()
     if not cfg or "items" not in cfg:
         await interaction.followup.send("❌ Market is not configured yet.")
         return
     items = cfg["items"]
 
+    # Load portfolio
     uid = str(user.id)
     pf = await db_client.market.portfolios.find_one({"_id": uid})
     if not pf:
         await interaction.followup.send("❌ No Inventory for that user.")
         return
 
-    use_next = await _use_next_prices_flag()
-    _, total_current = _portfolio_totals_with_mode(items, pf, use_next=False)
-    unspent, total_cash = _portfolio_totals_with_mode(items, pf, use_next=use_next)
+    # Decide pricing mode (respect freeze)
+    global_use_next = bool(cfg.get("use_next_for_total"))
+    next_year = int(cfg.get("next_year")) if cfg.get("next_year") is not None else None
+    use_next = global_use_next
+    frozen_note = False
+    if global_use_next and next_year is not None and pf.get("frozen_year") == next_year:
+        use_next = False
+        frozen_note = True
 
-    unspent = int(pf["cash"])
-    valuation = _holdings_valuation(items, pf, use_next)
-    total_cash = unspent + valuation
+    # Baselines
+    _, total_current = _portfolio_totals_with_mode(items, pf, use_next=False)   # always current
+    unspent, total_shown = _portfolio_totals_with_mode(items, pf, use_next=use_next)
 
+    # Holdings list (valued in the chosen mode)
+    holdings = pf.get("holdings", {}) or {}
     holdings_lines = []
     for code in ITEM_CODES:
-        qty = int(pf["holdings"].get(code, 0))
-        if qty > 0:
-            base = int(items[code]["price"])
-            p = int(items[code].get("next_price", base)) if use_next else base
-            value = qty * p
-            name = items[code]["name"]
-            holdings_lines.append(f"{code} - {name}: {qty} (≈ {value})")
+        qty = int(holdings.get(code, 0))
+        if qty <= 0:
+            continue
+        base = int(items[code]["price"])
+        p = int(items[code].get("next_price", base)) if use_next else base
+        value = qty * p
+        name = items[code]["name"]
+        holdings_lines.append(f"{code} - {name}: {qty} (≈ {value})")
 
+    # 2-decimal change vs current when NEXT is shown
     change_line = ""
     if use_next:
         if total_current > 0:
-            pct = (total_cash / total_current - 1.0) * 100.0
+            pct = (total_shown / total_current - 1.0) * 100.0
             change_line = f"\n**Change vs current:** {fmt_pct2_signed(pct)}"
         else:
             change_line = "\n**Change vs current:** N/A"
 
-    unspent, total = _portfolio_totals_with_mode(items, pf, use_next)
+    # Description
     mode_label = "NEXT-year prices" if use_next else "current prices"
+    frozen_line = f"\n_Valuation uses **CURRENT** prices (frozen for Y{next_year})._" if frozen_note else ""
     desc = (
-        f"_Valuation uses {mode_label}_\n\n"
+        f"_Valuation uses {mode_label}_{frozen_line}\n\n"
         f"**Unspent Cash**: {unspent}\n"
-        f"**Total Cash**: {total_cash}"
+        f"**Total Cash**: {total_shown}"
         f"{change_line}\n\n"
         + ("**Holdings**\n" + "\n".join(holdings_lines) if holdings_lines else "_No holdings_")
     )
+
     await interaction.followup.send(embed=Embed(
         title=f"Portfolio — {user.display_name}",
         description=desc,
@@ -1267,7 +1585,10 @@ interaction: Interaction,
     ))
 
 # ---------- Buy: spend Unspent Cash to increase holdings ----------
-@market_cmd.subcommand(name="buy", description="Buy items. Multiple pairs allowed (e.g., 'A 10, Apple 3').")
+@market_cmd.subcommand(
+    name="buy",
+    description="Buy items. Multiple pairs allowed (e.g., 'A 10, Apple 3')."
+)
 @guard(require_private=True, public=True, require_unlocked=True)
 async def market_purchase(
     interaction: Interaction,
@@ -1276,61 +1597,89 @@ async def market_purchase(
         required=True
     ),
 ):
+    # Load market config
     cfg = await _get_market_config()
     if not cfg or "items" not in cfg:
         await interaction.followup.send("❌ Market is not configured yet.")
         return
     items = cfg["items"]
 
+    # Load caller portfolio
     uid = str(interaction.user.id)
     pf_col = db_client.market.portfolios
     pf = await pf_col.find_one({"_id": uid})
     if not pf:
         await interaction.followup.send("❌ No portfolio. Use **/signup join** first.")
         return
+    pf["holdings"] = (pf.get("holdings") or {})  # defensive
+
+    # 🧊 Freeze gate (players cannot trade while quarantined for this NEXT year)
+    use_next_global = bool(cfg.get("use_next_for_total"))
+    next_year = int(cfg["next_year"]) if cfg.get("next_year") is not None else None
+    if use_next_global and next_year is not None and pf.get("frozen_year") == next_year:
+        await interaction.followup.send(
+            f"🧊 You are currently **frozen for Y{next_year}**. The host is resolving your inventory."
+        )
+        return
+
     # Parse "(item, qty)" pairs
     try:
-        pairs = _parse_orders(orders)
+        pairs = _parse_orders(orders)  # must return list[tuple[str,int]]
     except ValueError as e:
         await interaction.followup.send(f"❌ {e}")
         return
+    if not pairs:
+        await interaction.followup.send("❌ No valid orders found.")
+        return
 
-    # Pre-calc total cost and per-item limit
+    # Build add map & compute total cost; enforce per-item limits
     add_map: dict[str, int] = {}
     total_cost = 0
     for ident, qty in pairs:
+        if qty <= 0:
+            await interaction.followup.send("❌ Quantities must be positive integers.")
+            return
         code = _resolve_item_code(items, ident)
         if not code:
             await interaction.followup.send(f"❌ Unknown item: `{ident}`")
             return
         price = int(items[code]["price"])
         cur_qty = int(pf["holdings"].get(code, 0))
-        if cur_qty + qty > MAX_ITEM_UNITS:
-            await interaction.followup.send(f"❌ Holding limit exceeded for {code}. Max {MAX_ITEM_UNITS}.")
+        new_qty = cur_qty + add_map.get(code, 0) + qty
+        if new_qty > MAX_ITEM_UNITS:
+            await interaction.followup.send(
+                f"❌ Holding limit exceeded for {code}. Max {MAX_ITEM_UNITS}."
+            )
             return
         add_map[code] = add_map.get(code, 0) + qty
         total_cost += price * qty
 
-    # Debt check: Unspent Cash must stay >= 0 after purchase
-    if pf["cash"] - total_cost < 0:
+    # Debt check
+    cash_now = int(pf.get("cash", 0))
+    if cash_now - total_cost < 0:
         await interaction.followup.send(
-            f"❌ Not enough cash. Need {total_cost}, you have {pf['cash']} (debt not allowed)."
+            f"❌ Not enough cash. Need {total_cost}, you have {cash_now} (debt not allowed)."
         )
         return
 
-    # Apply updates
+    # Apply updates (atomic per user doc)
     for code, qty in add_map.items():
         pf["holdings"][code] = int(pf["holdings"].get(code, 0)) + qty
-    pf["cash"] -= total_cost
+    pf["cash"] = cash_now - total_cost
     await pf_col.update_one(
         {"_id": uid},
         {"$set": {"holdings": pf["holdings"], "cash": pf["cash"], "updated_at": _now_ts()}}
     )
 
+    # Totals for receipt (respect freeze logic if NEXT is active)
+    use_next = use_next_global
+    if use_next_global and next_year is not None and pf.get("frozen_year") == next_year:
+        use_next = False
+    unspent, total = _portfolio_totals_with_mode(items, pf, use_next=use_next)
+
     # Reply summary
     lines = [f"{code} ({items[code]['name']}): +{qty} @ {items[code]['price']}"
              for code, qty in add_map.items()]
-    unspent, total = _portfolio_totals(items, pf)
     await interaction.followup.send(
         "✅ Purchase complete:\n- " + "\n- ".join(lines) +
         f"\n**Unspent Cash**: {unspent}\n**Total Cash**: {total}"
@@ -1424,8 +1773,12 @@ async def market_admin_purchase(
         f"✅ Purchased for {user.mention}:\n- " + "\n- ".join(lines) +
         f"\n**Remaining Unspent Cash**: {cash}"
     )
+
 # ---------- Sell: convert holdings back to Unspent Cash ----------
-@market_cmd.subcommand(name="sell",description="Sell items. Multiple pairs allowed; partial sell allowed.")
+@market_cmd.subcommand(
+    name="sell",
+    description="Sell items. Multiple pairs allowed; partial sell allowed."
+)
 @guard(require_private=True, public=True, require_unlocked=True)
 async def market_sell(
     interaction: Interaction,
@@ -1434,31 +1787,51 @@ async def market_sell(
         required=True
     ),
 ):
+    # Load market config
     cfg = await _get_market_config()
     if not cfg or "items" not in cfg:
         await interaction.followup.send("❌ Market is not configured yet.")
         return
     items = cfg["items"]
 
+    # Load caller portfolio
     uid = str(interaction.user.id)
     pf_col = db_client.market.portfolios
     pf = await pf_col.find_one({"_id": uid})
     if not pf:
         await interaction.followup.send("❌ No portfolio. Use **/signup join** first.")
         return
+    pf["holdings"] = (pf.get("holdings") or {})
+    pf["cash"] = int(pf.get("cash", 0))
+
+    # 🧊 Freeze gate (players cannot trade while quarantined for this NEXT year)
+    use_next_global = bool(cfg.get("use_next_for_total"))
+    next_year = int(cfg["next_year"]) if cfg.get("next_year") is not None else None
+    if use_next_global and next_year is not None and pf.get("frozen_year") == next_year:
+        await interaction.followup.send(
+            f"🧊 You are currently **frozen for Y{next_year}**. The host is resolving your inventory."
+        )
+        return
 
     # Parse "(item, qty)" pairs
     try:
-        pairs = _parse_orders(orders)
+        pairs = _parse_orders(orders)  # -> list[tuple[str,int]]
     except ValueError as e:
         await interaction.followup.send(f"❌ {e}")
         return
+    if not pairs:
+        await interaction.followup.send("❌ No valid orders found.")
+        return
 
-    sold_lines = []
+    sold_lines: list[str] = []
     total_gain = 0
     any_success = False
 
     for ident, req_qty in pairs:
+        if req_qty <= 0:
+            sold_lines.append(f"❌ Invalid quantity for `{ident}` — must be positive.")
+            continue
+
         code = _resolve_item_code(items, ident)
         if not code:
             sold_lines.append(f"❌ Unknown item: `{ident}` — skipped")
@@ -1469,9 +1842,10 @@ async def market_sell(
             sold_lines.append(f"❌ {code} ({items[code]['name']}): you have 0 — rejected")
             continue
 
-        # Partial sell allowed: sell as much as the user has
+        # Partial sell allowed: sell up to what the user has
         sell_qty = min(have, req_qty)
-        gain = sell_qty * int(items[code]["price"])
+        price = int(items[code]["price"])  # sells refund **base (current) price**
+        gain = sell_qty * price
 
         pf["holdings"][code] = have - sell_qty
         pf["cash"] += gain
@@ -1480,10 +1854,10 @@ async def market_sell(
 
         if sell_qty < req_qty:
             sold_lines.append(
-                f"⚠️ {code} ({items[code]['name']}): requested {req_qty}, sold {sell_qty} (all you had) @ {items[code]['price']}"
+                f"⚠️ {code} ({items[code]['name']}): requested {req_qty}, sold {sell_qty} (all you had) @ {price}"
             )
         else:
-            sold_lines.append(f"✅ {code} ({items[code]['name']}): -{sell_qty} @ {items[code]['price']}")
+            sold_lines.append(f"✅ {code} ({items[code]['name']}): -{sell_qty} @ {price}")
 
     if any_success:
         await pf_col.update_one(
@@ -1491,11 +1865,17 @@ async def market_sell(
             {"$set": {"holdings": pf["holdings"], "cash": pf["cash"], "updated_at": _now_ts()}}
         )
 
-    unspent, total = _portfolio_totals(items, pf)
+    # Totals for the receipt (respect freeze logic if NEXT is active)
+    use_next = use_next_global
+    if use_next_global and next_year is not None and pf.get("frozen_year") == next_year:
+        use_next = False
+    unspent, total = _portfolio_totals_with_mode(items, pf, use_next=use_next)
+
     summary = "\n- ".join(sold_lines) if sold_lines else "(nothing parsed)"
     await interaction.followup.send(
         f"{summary}\n\n**Unspent Cash**: {unspent} (+{total_gain})\n**Total Cash**: {total}"
     )
+
 # ============= Subcommand "admin_sell" of "market" (Classic only) =============
 @market_cmd.subcommand(name="admin_sell",description="OWNER: Sell items from a player's holdings (refund at current price).")
 @guard(require_private=True, public=True, require_unlocked=True, owner_only=True)
@@ -1813,6 +2193,7 @@ async def stock_change_reveal_next(
         await interaction.followup.send("❌ Market is not configured.")
         return
 
+    pre_id = await _snapshot_pre_reveal(int(year))
     items = cfg["items"]
     for code in ITEM_CODES:
         base_price = int(items[code]["price"])
@@ -1862,13 +2243,27 @@ async def stock_change_liquidate(
     items = cfg["items"]
     use_next = bool(cfg.get("use_next_for_total"))
 
+    # Results year set by reveal step
+    result_year = int(cfg.get("next_year")) if "next_year" in cfg else None
+    if result_year is None:
+        await interaction.followup.send("❌ Cannot liquidate: no `next_year` set. Reveal prices first.")
+        return
+
+    # Snapshot BEFORE mutating anything
+    _ = await _snapshot_state_for_liquidate(result_year)
+
     portfolios = db_client.market.portfolios
     zero_holdings = {code: 0 for code in ITEM_CODES}
 
     modified = 0
+    skipped = 0
     async for pf in portfolios.find({}):
+        # If valuing at NEXT prices, skip quarantined portfolios for this year
+        if use_next and pf.get("frozen_year") == result_year:
+            skipped += 1
+            continue
+
         # Totals at the active valuation mode
-        unspent_before = int(pf.get("cash", 0))
         _, total_at_mode = _portfolio_totals_with_mode(items, pf, use_next=use_next)
 
         # Liquidate: cash becomes total; holdings go to zero
@@ -1882,11 +2277,88 @@ async def stock_change_liquidate(
         )
         modified += res.modified_count
 
+    # Keep only the newest snapshot
+    purged = await _purge_snapshots(keep_last=1)
+
     mode_label = "NEXT-year prices" if use_next else "current prices"
+    skipped_line = f"\nSkipped (frozen): **{skipped}**." if use_next else ""
     await interaction.followup.send(
-        f"✅ Liquidated holdings for **{modified}** portfolios at **{mode_label}**.\n"
-        f"All holdings set to 0; each player’s **Unspent Cash** now equals their **Total Cash** at that mode."
+        f"✅ Liquidated holdings for **{modified}** portfolios at **{mode_label}**."
+        f"{skipped_line}\n"
+        f"All holdings set to 0; each player’s **Unspent Cash** now equals their **Total Cash** at that mode.\n"
+        f"🧹 Snapshot housekeeping: purged **{purged}** older snapshot(s)."
     )
+
+# ============= Subcommand "revert" of "stock_change" =============
+@stock_change_cmd.subcommand(
+    name="revert",
+    description="Owner: revert to the latest liquidation snapshot (config + portfolios)."
+)
+async def stock_change_revert(
+    interaction: Interaction,
+    confirm: str = SlashOption(description="Type REVERT to proceed.", required=True),
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if interaction.user.id != OWNER_ID:
+        await interaction.followup.send("❌ Owner only.")
+        return
+    if confirm != "REVERT":
+        await interaction.followup.send("❌ Type `REVERT` to proceed.")
+        return
+
+    # 1) Load the latest liquidate snapshot
+    snap = await _snap_col().find_one(
+        {"type": "liquidate"},
+        sort=[("created_at", -1)]
+    )
+    if not snap:
+        await interaction.followup.send("❌ No liquidation snapshot found to revert to.")
+        return
+
+    # 2) Restore market config (unset NEXT flags & remove next_price)
+    cfg_col = db_client.market.config
+    cfg = await cfg_col.find_one({"_id": "current"}) or {"_id": "current", "items": {}}
+    items = cfg.get("items", {})
+
+    # Remove any next_price keys
+    for code in list(items.keys()):
+        if isinstance(items[code], dict) and "next_price" in items[code]:
+            items[code].pop("next_price", None)
+
+    # Flip flags OFF
+    await cfg_col.update_one(
+        {"_id": "current"},
+        {"$set": {"items": items, "use_next_for_total": False, "updated_at": _now_ts()},
+         "$unset": {"next_year": ""}},
+        upsert=True
+    )
+
+    # 3) Restore portfolios (cash/holdings) from snapshot
+    restored = 0
+    pf_col = db_client.market.portfolios
+    for p in snap.get("portfolios", []):
+        doc = {
+            "_id": p["_id"],
+            "cash": int(p.get("cash", 0)),
+            "holdings": p.get("holdings", {}) or {},
+            "updated_at": _now_ts(),
+        }
+        # Clear any freeze unless it was present in the snapshot
+        if "frozen_year" in p:
+            doc["frozen_year"] = p["frozen_year"]
+        else:
+            doc.pop("frozen_year", None)
+        await pf_col.replace_one({"_id": p["_id"]}, doc, upsert=True)
+        restored += 1
+
+    await interaction.followup.send(
+        f"↩️ Reverted to latest snapshot.\n"
+        f"- Restored portfolios: **{restored}**\n"
+        f"- NEXT pricing disabled; `next_year` cleared; `next_price` removed."
+    )
+
+#===================================================
 
 
 

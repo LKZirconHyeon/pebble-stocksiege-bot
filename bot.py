@@ -2,30 +2,36 @@ from motor.motor_asyncio import AsyncIOMotorClient  # MongoDB library
 import nextcord  # Discord bot library
 from nextcord.ext import commands
 from nextcord import Interaction, SlashOption, SelectOption, ButtonStyle, Embed, Member, AllowedMentions, Colour, Message
-from nextcord.ui import View, Button, Modal, TextInput, Select
+from nextcord.ui import View, Button, button, Modal, TextInput, Select
 from datetime import datetime
 from dotenv import load_dotenv
 import os
 import re
 import copy
+import functools
 
 load_dotenv()
 db_client = AsyncIOMotorClient(os.getenv("DB_URL"))  # put link to database, MongoDB has free cloud service
-
 bot = commands.Bot(intents=nextcord.Intents(guilds=True, members=True, message_content=True, messages=True))
 
+# Basic Setup
 OWNER_ID = int(os.getenv("OWNER_ID"))
 ODDS = {-80: 20, -75: 18, -70: 15, -60: 12, -50: 10, -45: 9, -40: 8, -35: 7, -30: 6, -25: 5, -20: 4, -15: 3, -10: 2, -5: 1, 0: 0, 5: -1, 10: -1, 15: -2, 20: -2, 25: -3, 30: -3, 40: -4, 50: -5, 60: -6, 70: -7, 80: -8, 90: -9, 100: -10, 150: -12, 200: -15, 300: -18, 400: -20}
 NORMAL_STOCK_CHANGES = tuple(ODDS.keys())
 BOT_COLOUR = Colour.from_rgb(169, 46, 33)
 MAX_PLAYERS = 24
 
+# Signup Setup
 COLOR_NAME_RE = re.compile(r'^[A-Za-z ]{3,20}$')
 HEX_RE = re.compile(r'^#?(?:[0-9a-fA-F]{6})$')
 
+# Numeric & Item Setup
 STARTING_CASH = 500_000
 MAX_ITEM_UNITS = 9_999_999
 ITEM_CODES = list("ABCDEFGH")
+
+# Non-Classic Gamemode Setup
+GAME_MODES = ("classic", "apocalypse", "elimination")
 
 # Base Format Layers
 def _env_int(name: str) -> int | None:
@@ -109,11 +115,6 @@ def _now_ts() -> int:
 
 async def _get_market_config():
     return await db_client.market.config.find_one({"_id": "current"})  # {"items":{A:{name,price},...}}
-
-async def _use_next_prices_flag() -> bool:
-    """Toggle set by /stock_change reveal_next. When True, portfolios value at next_price."""
-    cfg = await db_client.market.config.find_one({"_id": "current"}, {"use_next_for_total": 1})
-    return bool(cfg and cfg.get("use_next_for_total"))
 
 def _portfolio_totals_with_mode(items_cfg: dict, portfolio: dict, use_next: bool) -> tuple[int, int]:
     """Return (unspent_cash, total_cash) where total = cash + sum(qty * price_mode)."""
@@ -208,19 +209,6 @@ def _signup_needed_msg_self() -> str:
         "You don’t have a Hint Point Inventory (you haven’t signed up yet).\n\n"
         f"Please run {mention} to sign up and create one (0 pt)."
     )
-
-def _holdings_valuation(items_cfg: dict, portfolio: dict, use_next: bool) -> int:
-    """Sum(qty × price_mode) for the portfolio's holdings."""
-    holdings = portfolio.get("holdings", {})
-    total = 0
-    for code in ITEM_CODES:
-        qty = int(holdings.get(code, 0))
-        if qty <= 0 or code not in items_cfg:
-            continue
-        base = int(items_cfg[code]["price"])
-        price = int(items_cfg[code].get("next_price", base)) if use_next else base
-        total += qty * price
-    return total
 
 def _parse_orders(raw: str) -> list[tuple[str, int]]:
     """
@@ -455,6 +443,156 @@ async def _set_game_started(started: bool) -> None:
         {"$set": {"started": bool(started), "locked_at": _now_ts() if started else None}},
         upsert=True
     )
+# ===================== Game Mode Helpers =====================
+async def _get_game_mode() -> str:
+    """Return current game mode (default: classic)."""
+    doc = await db_client.market.config.find_one({"_id": "current"}, {"game_mode": 1})
+    mode = (doc or {}).get("game_mode", "classic")
+    return mode if mode in GAME_MODES else "classic"
+
+async def _is_eliminated_user(user_id: str) -> tuple[bool, int | None]:
+    """Check if a portfolio is eliminated. Return (eliminated, elim_year)."""
+    pf = await db_client.market.portfolios.find_one({"_id": str(user_id)}, {"eliminated": 1, "elim_year": 1})
+    if not pf:
+        return (False, None)
+    if pf.get("eliminated"):
+        return (True, int(pf.get("elim_year", 0)) or None)
+    return (False, None)
+
+async def _set_eliminated(user_id: str, year: int) -> None:
+    """Mark a portfolio as eliminated at the given DB year."""
+    await db_client.market.portfolios.update_one(
+        {"_id": str(user_id)},
+        {"$set": {"eliminated": True, "elim_year": int(year), "updated_at": int(datetime.now().timestamp())}},
+        upsert=False
+    )
+
+async def _mode_is(*targets: str) -> bool:
+    """Return True if current game mode is one of targets."""
+    mode = await _get_game_mode()
+    return mode in targets
+
+async def _safe_reply(interaction, content: str, public: bool = False):
+    """Reply safely whether the interaction has been deferred or not."""
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=not public)
+        else:
+            await interaction.response.send_message(content, ephemeral=not public)
+    except Exception:
+        # As a last resort (rare), try followup
+        await interaction.followup.send(content, ephemeral=not public)
+
+def requires_mode(*modes: str, public: bool = False):
+    """
+    Decorator to gate a command to specific mode(s).
+    Example: @requires_mode("elimination", public=True)
+    """
+    def deco(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            # Heuristic: find the Interaction argument
+            interaction = kwargs.get("interaction", None)
+            if interaction is None:
+                # Usually the first positional arg is Interaction in our free functions
+                for a in args:
+                    # duck-typing to avoid importing nextcord types here
+                    if hasattr(a, "response") and hasattr(a, "followup"):
+                        interaction = a
+                        break
+            if interaction is None:
+                # Fallback: just run
+                return await func(*args, **kwargs)
+
+            if not await _mode_is(*modes):
+                want = " / ".join(modes)
+                cur = await _get_game_mode()
+                await _safe_reply(
+                    interaction,
+                    f"⛔ This command is available only in **{want}** mode(s). Current mode: **{cur}**.",
+                    public=public,
+                )
+                return
+            return await func(*args, **kwargs)
+        return wrapper
+    return deco
+
+# -------- Hint: elimination-only self-use gate (keep once) --------
+
+def disallow_self_hint_when_eliminated(public: bool = True):
+    """
+    For self-use hint commands (R/LVL1/LVL2/LVL3).
+    - In elimination mode: if caller is eliminated, block.
+    - In other modes: do nothing.
+    """
+    def deco(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            interaction = kwargs.get("interaction")
+            if interaction is None:
+                for a in args:
+                    if hasattr(a, "response") and hasattr(a, "followup"):
+                        interaction = a
+                        break
+            if interaction is None:
+                return await func(*args, **kwargs)
+
+            if await _mode_is("elimination"):
+                is_elim, _ = await _is_eliminated_user(str(interaction.user.id))
+                if is_elim:
+                    msg = ("⛔ Eliminated players cannot use hint abilities for themselves. "
+                           "You may still **transfer** hint points to support others.")
+                    if interaction.response.is_done():
+                        await interaction.followup.send(msg, ephemeral=not public)
+                    else:
+                        await interaction.response.send_message(msg, ephemeral=not public)
+                    return
+            return await func(*args, **kwargs)
+        return wrapper
+    return deco
+
+async def _block_if_eliminated(interaction: Interaction, user_id: str) -> bool:
+    """
+    In elimination mode: if the given portfolio is eliminated, announce and block the action.
+    Returns True if the action should be blocked.
+    """
+    if await _mode_is("elimination"):
+        is_elim, elim_year = await _is_eliminated_user(user_id)
+        if is_elim:
+            await interaction.followup.send(
+                "⛔ This portfolio has been **eliminated** and cannot trade (buy/sell)."
+            )
+            return True
+    return False
+
+# -------- Elimination round utils --------
+async def _current_result_year() -> int | None:
+    """
+    Read DB's last_result_year written after liquidate.
+    Returns None if not set.
+    """
+    cfg = await db_client.market.config.find_one({"_id": "current"}, {"last_result_year": 1})
+    if not cfg:
+        return None
+    try:
+        return int(cfg.get("last_result_year", 0)) or None
+    except Exception:
+        return None
+
+async def _bottom_three_survivors() -> list[tuple[str, int]]:
+    """
+    Return bottom-3 (uid, cash) among NON-eliminated portfolios.
+    Deterministic tie-break: cash asc, then _id asc.
+    """
+    survivors = []
+    async for pf in db_client.market.portfolios.find(
+        {"$or": [{"eliminated": {"$exists": False}}, {"eliminated": False}]},
+        {"cash": 1}
+    ):
+        survivors.append((pf["_id"], int(pf.get("cash", 0))))
+    survivors.sort(key=lambda x: (x[1], x[0]))  # cash asc, then id
+    return survivors[:3]
+
 # Base Format Layers
 
 
@@ -1613,6 +1751,10 @@ async def market_purchase(
         return
     pf["holdings"] = (pf.get("holdings") or {})  # defensive
 
+    # ⛔ Elimination gate (self)
+    if await _block_if_eliminated(interaction, uid):
+        return
+    
     # 🧊 Freeze gate (players cannot trade while quarantined for this NEXT year)
     use_next_global = bool(cfg.get("use_next_for_total"))
     next_year = int(cfg["next_year"]) if cfg.get("next_year") is not None else None
@@ -1662,6 +1804,15 @@ async def market_purchase(
         )
         return
 
+    # Elimination gate: only enforce in elimination mode
+    if await _mode_is("elimination"):
+        is_elim, elim_year = await _is_eliminated_user(str(interaction.user.id))  # self-trade
+        if is_elim:
+            await interaction.followup.send(
+                "⛔ This portfolio has been **eliminated** and cannot trade (buy/sell)."
+            )
+            return
+    
     # Apply updates (atomic per user doc)
     for code, qty in add_map.items():
         pf["holdings"][code] = int(pf["holdings"].get(code, 0)) + qty
@@ -1713,6 +1864,10 @@ async def market_admin_purchase(
         )
         return
 
+    # ⛔ Elimination gate (self)
+    if await _block_if_eliminated(interaction, uid):
+        return
+    
     # Parse orders → [(identifier, qty)]
     try:
         pairs = _parse_admin_orders(orders)
@@ -1804,6 +1959,10 @@ async def market_sell(
     pf["holdings"] = (pf.get("holdings") or {})
     pf["cash"] = int(pf.get("cash", 0))
 
+    # ⛔ Elimination gate (self)
+    if await _block_if_eliminated(interaction, uid):
+        return
+    
     # 🧊 Freeze gate (players cannot trade while quarantined for this NEXT year)
     use_next_global = bool(cfg.get("use_next_for_total"))
     next_year = int(cfg["next_year"]) if cfg.get("next_year") is not None else None
@@ -1902,6 +2061,10 @@ async def market_admin_sell(
         await interaction.followup.send(f"❌ {user.mention} has no portfolio. They must **/signup join** first.")
         return
 
+    # ⛔ Elimination gate (self)
+    if await _block_if_eliminated(interaction, uid):
+        return
+    
     # Parse orders
     try:
         pairs = _parse_admin_orders(orders)   # re-use the helper from admin_purchase
@@ -2374,60 +2537,55 @@ async def use_hint(interaction: Interaction):
     pass
 
 def calculate_odds(years: list):
-    print(years)
+    """Compute per-stock odds (0..100) from year docs using the EXISTING ODDS mapping."""
     stocks = "ABCDEFGH"
-    stock_odds = {stock: 50 for stock in stocks}
-    years.sort(key=lambda year: year['_id'])
-    for year in years:
-        print(year)
-        for stock, change in year.items():
-            if stock == "_id":
+    stock_odds = {s: 50 for s in stocks}
+    years.sort(key=lambda y: y.get('_id', 0))
+    for y in years:
+        for s in stocks:
+            if s not in y:
                 continue
-            stock_odds[stock] += ODDS[change]
-            stock_odds[stock] = max(min(stock_odds[stock], 100), 0)
+            change = int(y[s])
+            stock_odds[s] += ODDS.get(change, 0)  # safe lookup
+            stock_odds[s] = max(0, min(100, stock_odds[s]))
     return stock_odds
+
 #===================================================
-@use_hint.subcommand(name="r",description="Reveal odds of all stocks. Costs 1 HP.",)
+@use_hint.subcommand(name="r", description="Reveal odds of all stocks. Costs 1 HP.")
 @guard(require_private=True, public=True, require_unlocked=True)
+@disallow_self_hint_when_eliminated(public=True)
 async def r_hint(
-        interaction: Interaction,
-        confirm: str = SlashOption(
-            description="put R HINT in this to proceed.",
-            required=True,
-        ),
+    interaction: Interaction,
+    confirm: str = SlashOption(description="put R HINT in this to proceed.", required=True),
 ):
     await interaction.response.defer()
     if confirm != "R HINT":
         await interaction.followup.send("Command rejected. Put ``R HINT`` in the ``confirm`` option to use an r hint.")
         return
-    
-    # Global lock guard (shared with trading)
+
     if await _trading_locked():
         await interaction.followup.send("❌ Hint usage is temporarily locked by the host.")
         return
 
-    # Load user's hint bank
     hint_collection = db_client.hint_points.balance
     hint_bank = await hint_collection.find_one({"_id": str(interaction.user.id)})
     if hint_bank is None:
         await interaction.followup.send(_signup_needed_msg_self())
         return
+    hint_bank.setdefault("history", [])  # safety
 
-    # Balance check
-    hint_points = int(hint_bank.get("balance", 0))
-    if hint_points < 1:
+    if int(hint_bank.get("balance", 0)) < 1:
         hint_bank["history"].sort(key=lambda x: x["time"], reverse=True)
         history = paginate_list(hint_bank["history"])
         balance_view = BankBalanceViewer(0, hint_bank["balance"], history, interaction.user)
-        balance_embed = format_balance_embed(balance_view)
         await interaction.followup.send(
-            f"You need 1 hint point to use an R hint. You only have {hint_points} hint points.",
-            embed=balance_embed,
+            f"You need 1 hint point to use an R hint. You only have {hint_bank.get('balance', 0)} hint points.",
+            embed=format_balance_embed(balance_view),
             view=balance_view,
         )
         return
 
-    # Build odds from all years except latest (R-hint rule)
+    # All years except the latest (R-hint rule)
     collection = db_client.stocks.changes
     years = [doc async for doc in collection.find({})]
     years.sort(key=lambda y: y['_id'])
@@ -2443,95 +2601,85 @@ async def r_hint(
 
     # Deduct 1 HP
     hint_bank["balance"] = int(hint_bank["balance"]) - 1
-    history_entry = {
+    hint_bank["history"].append({
         "time": int(datetime.now().timestamp()),
         "change": -1,
         "new_balance": hint_bank["balance"],
         "user_id": str(bot.user.id),
         "reason": "Used R-hint."
-    }
-    hint_bank["history"].append(history_entry)
+    })
     await hint_collection.update_one({"_id": str(interaction.user.id)}, {"$set": {
         "balance": hint_bank["balance"],
         "history": hint_bank["history"],
     }})
 
-    # Pretty-print with names
+    # Pretty print (A..H order)
     items_cfg = (await _get_market_config() or {}).get("items", {})
-    odd_lines = [f"{_item_label(code, items_cfg)}: {pct}%"
-                 for code, pct in odds.items()]
+    odd_lines = [f"{_item_label(code, items_cfg)}: {odds.get(code, 50)}%" for code in "ABCDEFGH"]
+
     hint_bank["history"].sort(key=lambda x: x["time"], reverse=True)
     history = paginate_list(hint_bank["history"])
     balance_view = BankBalanceViewer(0, hint_bank["balance"], history, interaction.user)
-    balance_embed = format_balance_embed(balance_view)
 
-    await interaction.followup.send("Used R-hint!\n\n" + "\n".join(odd_lines),embed=balance_embed,view=balance_view,)
+    await interaction.followup.send(
+        "Used R-hint!\n\n" + "\n".join(odd_lines),
+        embed=format_balance_embed(balance_view),
+        view=balance_view,
+    )
 #===================================================
-@use_hint.subcommand(name="lvl1",description="Reveals the strength of change for a single stock. Costs 1 HP.",)
+@use_hint.subcommand(name="lvl1", description="Reveals the strength of change for a single stock. Costs 1 HP.")
 @guard(require_private=True, public=True, require_unlocked=True)
+@disallow_self_hint_when_eliminated(public=True)
 async def lvl1_hint(
-        interaction: Interaction,
-        stock: str = SlashOption(
-            description="The stock you want to use this hint on.",
-            required=True,
-            choices=[s for s in "ABCDEFGH"]
-        ),
-        confirm: str = SlashOption(
-            description="put LVL1 in this to proceed.",
-            required=True,
-        ),
+    interaction: Interaction,
+    stock: str = SlashOption(description="The stock you want to use this hint on.", required=True, choices=[s for s in "ABCDEFGH"]),
+    confirm: str = SlashOption(description="put LVL1 in this to proceed.", required=True),
 ):
     await interaction.response.defer()
     if confirm != "LVL1":
         await interaction.followup.send("Command rejected. Put ``LVL1`` in the ``confirm`` option to use a hint.")
         return
-    
-    # Global lock guard (shared with trading)
+
     if await _trading_locked():
         await interaction.followup.send("❌ Hint usage is temporarily locked by the host.")
         return
 
-    # Bank lookup
     hint_collection = db_client.hint_points.balance
     hint_bank = await hint_collection.find_one({"_id": str(interaction.user.id)})
     if hint_bank is None:
         await interaction.followup.send(_signup_needed_msg_self())
         return
+    hint_bank.setdefault("history", [])
 
-    # Balance check
-    hint_points = int(hint_bank.get("balance", 0))
-    if hint_points < 1:
+    if int(hint_bank.get("balance", 0)) < 1:
         hint_bank["history"].sort(key=lambda x: x["time"], reverse=True)
         history = paginate_list(hint_bank["history"])
         balance_view = BankBalanceViewer(0, hint_bank["balance"], history, interaction.user)
-        balance_embed = format_balance_embed(balance_view)
         await interaction.followup.send(
-            f"You need 1 hint point to use a level 1 hint. You only have {hint_points} hint points.",
-            embed=balance_embed,
+            f"You need 1 hint point to use a level 1 hint. You only have {hint_bank.get('balance',0)} hint points.",
+            embed=format_balance_embed(balance_view),
             view=balance_view,
         )
         return
 
-    # Latest year change
+    # Latest year
     collection = db_client.stocks.changes
     years = [doc async for doc in collection.find({})]
     years.sort(key=lambda y: y['_id'])
-    if not years:
-        await interaction.followup.send(
-            "There is no stock info in this bot's database.\n"
-            "Either the host did not update stock info, or this is the start of a season (All stocks 50%)."
-        )
+    if not years or stock not in years[-1]:
+        await interaction.followup.send("No latest change info for that stock.")
         return
     latest = years[-1]
     stock_change = int(latest[stock])
-    odds_change = int(ODDS[stock_change])
+    odds_change = int(ODDS.get(stock_change, 0))  # safe
 
-    # Strength buckets
     items_cfg = (await _get_market_config() or {}).get("items", {})
     label = _item_label(stock, items_cfg)
-    if abs(odds_change) <= 3:
+
+    abs_o = abs(odds_change)
+    if abs_o <= 3:
         strength = "**Low**"
-    elif abs(odds_change) <= 9:
+    elif abs_o <= 9:
         strength = "**Medium**"
     else:
         strength = "**High**"
@@ -2546,58 +2694,44 @@ async def lvl1_hint(
         "user_id": str(bot.user.id),
         "reason": f"Used level 1 hint on stock {stock}."
     })
-    await hint_collection.update_one({"_id": str(interaction.user.id)}, {"$set": {
-        "balance": hint_bank["balance"],
-        "history": hint_bank["history"],
-    }})
+    await hint_collection.update_one({"_id": str(interaction.user.id)}, {"$set": hint_bank})
 
     hint_bank["history"].sort(key=lambda x: x["time"], reverse=True)
     history = paginate_list(hint_bank["history"])
     balance_view = BankBalanceViewer(0, hint_bank["balance"], history, interaction.user)
-    balance_embed = format_balance_embed(balance_view)
-    await interaction.followup.send(change_info, embed=balance_embed, view=balance_view)
+    await interaction.followup.send(change_info, embed=format_balance_embed(balance_view), view=balance_view)
 #===================================================
-@use_hint.subcommand(name="lvl2",description="Gives 2 possible changes for a stock. Costs 2 HP",)
+@use_hint.subcommand(name="lvl2", description="Gives 2 possible changes for a stock. Costs 2 HP")
 @guard(require_private=True, public=True, require_unlocked=True)
+@disallow_self_hint_when_eliminated(public=True)
 async def lvl2_hint(
-        interaction: Interaction,
-        stock: str = SlashOption(
-            description="The stock you want to use this hint on.",
-            required=True,
-            choices=[s for s in "ABCDEFGH"]
-        ),
-        confirm: str = SlashOption(
-            description="put LVL2 in this to proceed.",
-            required=True,
-        ),
+    interaction: Interaction,
+    stock: str = SlashOption(description="The stock you want to use this hint on.", required=True, choices=[s for s in "ABCDEFGH"]),
+    confirm: str = SlashOption(description="put LVL2 in this to proceed.", required=True),
 ):
     await interaction.response.defer()
     if confirm != "LVL2":
         await interaction.followup.send("Command rejected. Put ``LVL2`` in the ``confirm`` option to use a hint.")
         return
-    
-    # Global lock guard (shared with trading)
+
     if await _trading_locked():
         await interaction.followup.send("❌ Hint usage is temporarily locked by the host.")
         return
 
-    # Bank lookup
     hint_collection = db_client.hint_points.balance
     hint_bank = await hint_collection.find_one({"_id": str(interaction.user.id)})
     if hint_bank is None:
         await interaction.followup.send(_signup_needed_msg_self())
         return
+    hint_bank.setdefault("history", [])
 
-    # Balance check
-    hint_points = int(hint_bank.get("balance", 0))
-    if hint_points < 2:
+    if int(hint_bank.get("balance", 0)) < 2:
         hint_bank["history"].sort(key=lambda x: x["time"], reverse=True)
         history = paginate_list(hint_bank["history"])
         balance_view = BankBalanceViewer(0, hint_bank["balance"], history, interaction.user)
-        balance_embed = format_balance_embed(balance_view)
         await interaction.followup.send(
-            f"You need 2 hint point to use a level 2 hint. You only have {hint_points} hint points.",
-            embed=balance_embed,
+            f"You need 2 hint point to use a level 2 hint. You only have {hint_bank.get('balance',0)} hint points.",
+            embed=format_balance_embed(balance_view),
             view=balance_view,
         )
         return
@@ -2606,33 +2740,31 @@ async def lvl2_hint(
     collection = db_client.stocks.changes
     years = [doc async for doc in collection.find({})]
     years.sort(key=lambda y: y['_id'])
-    if not years:
-        await interaction.followup.send(
-            "There is no stock info in this bot's database.\n"
-            "Either the host did not update stock info, or this is the start of a season (All stocks 50%)."
-        )
+    if not years or stock not in years[-1]:
+        await interaction.followup.send("No latest change info for that stock.")
         return
     latest = years[-1]
     stock_change = int(latest[stock])
-    odds_change = int(ODDS[stock_change])
+    base_odd = int(ODDS.get(stock_change, 0))
 
-    # Find opposite-odds change (safe init)
-    opposite_change = None
-    for change, other_odd_change in ODDS.items():
-        if int(other_odd_change) == -odds_change:
-            opposite_change = int(change)
-            break
+    # Find a second candidate from the opposite side with *closest* odd magnitude
+    # (ODDS table may be asymmetric; fall back to nearest by absolute difference)
+    best_other = None
+    best_diff = None
+    target = -base_odd  # prefer opposite odd value if exists
+    for change_val, odd_val in ODDS.items():
+        if int(change_val) == stock_change:
+            continue
+        diff = abs(int(odd_val) - target)
+        if best_diff is None or diff < best_diff:
+            best_diff = diff
+            best_other = int(change_val)
 
     items_cfg = (await _get_market_config() or {}).get("items", {})
     label = _item_label(stock, items_cfg)
 
-    if opposite_change is None:
-        # Fallback: just show the known change twice (edge case)
-        pair = (stock_change, stock_change)
-    else:
-        pair = tuple(sorted([stock_change, opposite_change]))
-
-    change_info = f"Used level 2 hint!\n\nPossible changes for {label}: **{pair[0]}%, {pair[1]}%**"
+    a, b = sorted([stock_change, best_other if best_other is not None else stock_change])
+    change_info = f"Used level 2 hint!\n\nPossible changes for {label}: **{a}%, {b}%**"
 
     # Deduct 2 HP
     hint_bank["balance"] -= 2
@@ -2643,71 +2775,53 @@ async def lvl2_hint(
         "user_id": str(bot.user.id),
         "reason": f"Used level 2 hint on stock {stock}."
     })
-    await hint_collection.update_one({"_id": str(interaction.user.id)}, {"$set": {
-        "balance": hint_bank["balance"],
-        "history": hint_bank["history"],
-    }})
+    await hint_collection.update_one({"_id": str(interaction.user.id)}, {"$set": hint_bank})
 
     hint_bank["history"].sort(key=lambda x: x["time"], reverse=True)
     history = paginate_list(hint_bank["history"])
     balance_view = BankBalanceViewer(0, hint_bank["balance"], history, interaction.user)
-    balance_embed = format_balance_embed(balance_view)
-    await interaction.followup.send(change_info, embed=balance_embed, view=balance_view)
+    await interaction.followup.send(change_info, embed=format_balance_embed(balance_view), view=balance_view)
 #===================================================
-@use_hint.subcommand(name="lvl3",description="Shows whether a stock will increase or decrease. Costs 3 HP",)
+@use_hint.subcommand(name="lvl3", description="Shows whether a stock will increase or decrease. Costs 3 HP")
 @guard(require_private=True, public=True, require_unlocked=True)
+@disallow_self_hint_when_eliminated(public=True)
 async def lvl3_hint(
-        interaction: Interaction,
-        stock: str = SlashOption(
-            description="The stock you want to use this hint on.",
-            required=True,
-            choices=[s for s in "ABCDEFGH"]
-        ),
-        confirm: str = SlashOption(
-            description="put LVL3 in this to proceed.",
-            required=True,
-        ),
+    interaction: Interaction,
+    stock: str = SlashOption(description="The stock you want to use this hint on.", required=True, choices=[s for s in "ABCDEFGH"]),
+    confirm: str = SlashOption(description="put LVL3 in this to proceed.", required=True),
 ):
     await interaction.response.defer()
     if confirm != "LVL3":
         await interaction.followup.send("Command rejected. Put ``LVL3`` in the ``confirm`` option to use a hint.")
         return
-    
-    # Global lock guard (shared with trading)
+
     if await _trading_locked():
         await interaction.followup.send("❌ Hint usage is temporarily locked by the host.")
         return
 
-    # Bank lookup
     hint_collection = db_client.hint_points.balance
     hint_bank = await hint_collection.find_one({"_id": str(interaction.user.id)})
     if hint_bank is None:
         await interaction.followup.send(_signup_needed_msg_self())
         return
+    hint_bank.setdefault("history", [])
 
-    # Balance check
-    hint_points = int(hint_bank.get("balance", 0))
-    if hint_points < 3:
+    if int(hint_bank.get("balance", 0)) < 3:
         hint_bank["history"].sort(key=lambda x: x["time"], reverse=True)
         history = paginate_list(hint_bank["history"])
         balance_view = BankBalanceViewer(0, hint_bank["balance"], history, interaction.user)
-        balance_embed = format_balance_embed(balance_view)
         await interaction.followup.send(
-            f"You need 3 hint point to use a level 3 hint. You only have {hint_points} hint points.",
-            embed=balance_embed,
+            f"You need 3 hint point to use a level 3 hint. You only have {hint_bank.get('balance',0)} hint points.",
+            embed=format_balance_embed(balance_view),
             view=balance_view,
         )
         return
 
-    # Latest year change
     collection = db_client.stocks.changes
     years = [doc async for doc in collection.find({})]
     years.sort(key=lambda y: y['_id'])
-    if not years:
-        await interaction.followup.send(
-            "There is no stock info in this bot's database.\n"
-            "Either the host did not update stock info, or this is the start of a season (All stocks 50%)."
-        )
+    if not years or stock not in years[-1]:
+        await interaction.followup.send("No latest change info for that stock.")
         return
     latest = years[-1]
     stock_change = int(latest[stock])
@@ -2733,16 +2847,166 @@ async def lvl3_hint(
         "user_id": str(bot.user.id),
         "reason": f"Used level 3 hint on stock {stock}."
     })
-    await hint_collection.update_one({"_id": str(interaction.user.id)}, {"$set": {
-        "balance": hint_bank["balance"],
-        "history": hint_bank["history"],
-    }})
+    await hint_collection.update_one({"_id": str(interaction.user.id)}, {"$set": hint_bank})
 
     hint_bank["history"].sort(key=lambda x: x["time"], reverse=True)
     history = paginate_list(hint_bank["history"])
     balance_view = BankBalanceViewer(0, hint_bank["balance"], history, interaction.user)
-    balance_embed = format_balance_embed(balance_view)
-    await interaction.followup.send(change_info, embed=balance_embed, view=balance_view)
+    await interaction.followup.send(change_info, embed=format_balance_embed(balance_view), view=balance_view)
+#===================================================
+# Elimination Gamemode ONLY
+
+# ---------- Admin: full cash ranking (public) ----------
+@market_cmd.subcommand(
+    name="cash_rank",
+    description="OWNER: Show full cash ranking of all players (public)."
+)
+@guard(require_private=True, public=True, owner_only=True)
+@requires_mode("elimination", public=True)
+async def market_cash_rank(interaction: Interaction):
+    # Load portfolios
+    portfolios = []
+    async for pf in db_client.market.portfolios.find({}):
+        portfolios.append(pf)
+    if not portfolios:
+        await interaction.followup.send("No portfolios found.")
+        return
+
+    # Sort by cash desc; annotate eliminated
+    portfolios.sort(key=lambda p: int(p.get("cash", 0)), reverse=True)
+    lines = []
+    for i, p in enumerate(portfolios, 1):
+        uid = p["_id"]
+        eliminated = bool(p.get("eliminated"))
+        cash = int(p.get("cash", 0))
+        tag = " ⛔ ELIM" if eliminated else ""
+        lines.append(f"{i}. <@{uid}> — {cash}{tag}")
+
+    embed = Embed(
+        title="Full Cash Ranking (All Players)",
+        description="\n".join(lines),
+        colour=BOT_COLOUR
+    )
+    await interaction.followup.send(embed=embed)
+
+@bot.slash_command(
+    name="elim_cut",
+    description="OWNER: Preview & confirm the 3 eliminations for this result (DB 5~10). Public."
+)
+@guard(require_private=True, public=True, owner_only=True)
+@requires_mode("elimination", public=True)   # other modes -> block with notice
+async def elimination_cut(interaction: Interaction):
+    await interaction.response.defer()
+
+    # Check result year window: DB 5~10 == 4th~9th result
+    ry = await _current_result_year()
+    if ry is None:
+        await interaction.followup.send("❌ No `last_result_year` recorded yet. Run liquidation first.")
+        return
+    if not (5 <= ry <= 10):
+        await interaction.followup.send(f"⛔ Eliminations run only for DB 5~10. Current DB={ry}.")
+        return
+
+    # Prevent duplicate cut for same year
+    already = await db_client.market.portfolios.count_documents({"elim_year": int(ry)})
+    if already > 0:
+        await interaction.followup.send(f"⛔ Eliminations for DB {ry} already executed.")
+        return
+
+    # Select bottom 3 (preview)
+    candidates = await _bottom_three_survivors()
+    if len(candidates) < 3:
+        await interaction.followup.send("❌ Not enough survivors to eliminate 3 players.")
+        return
+
+    # Pretty list
+    lines = [f"- <@{uid}> — {cash}" for uid, cash in candidates]
+    # Map DB year to “Nth result”: DB 5 == 4th result → N = ry - 1
+    nth = ry - 1
+
+    embed = Embed(
+        title=f"Elimination Preview — DB {ry} (Result #{nth})",
+        description=(
+            "The following players are the **bottom 3 by unspent cash** and will be eliminated.\n"
+            + "\n".join(lines) +
+            "\n\nPress **Confirm Cut** to finalize.\n"
+            "_Once executed, eliminated portfolios cannot buy/sell (admin override disabled)._"
+        ),
+        colour=BOT_COLOUR
+    )
+
+    class ElimCutView(View):
+        def __init__(self, owner_id: int, year: int, preview: list[tuple[str, int]]):
+            super().__init__(timeout=600)
+            self.owner_id = owner_id
+            self.year = int(year)
+            self.preview = preview  # [(uid, cash), ...]
+
+        async def interaction_check(self, btn_inter: Interaction) -> bool:
+            # Owner-only clicks
+            if btn_inter.user.id != self.owner_id:
+                await btn_inter.response.send_message("Owner only.", ephemeral=True)
+                return False
+            return True
+
+        @button(label="Confirm Cut (3 players)", style=ButtonStyle.danger)
+        async def confirm(self, btn: Button, btn_inter: Interaction):
+            await btn_inter.response.defer()
+
+            # Sanity checks again at commit time
+            if not await _mode_is("elimination"):
+                await btn_inter.followup.send("⛔ Not in elimination mode anymore. Aborting.")
+                self.disable_all_items()
+                return
+
+            ry2 = await _current_result_year()
+            if ry2 != self.year:
+                await btn_inter.followup.send(f"⛔ Result year changed (now DB {ry2}). Aborting.")
+                self.disable_all_items()
+                return
+
+            already2 = await db_client.market.portfolios.count_documents({"elim_year": int(self.year)})
+            if already2 > 0:
+                await btn_inter.followup.send(f"⛔ Eliminations for DB {self.year} already executed.")
+                self.disable_all_items()
+                return
+
+            # Recompute bottom 3 at commit to avoid race; we expect they match preview.
+            current = await _bottom_three_survivors()
+            if len(current) < 3:
+                await btn_inter.followup.send("❌ Not enough survivors now. Aborting.")
+                self.disable_all_items()
+                return
+
+            # Mark eliminated
+            for uid, _cash in current:
+                await _set_eliminated(uid, self.year)
+
+            # Announce and freeze buttons
+            lines_now = [f"- <@{uid}>" for uid, _ in current]
+            done_embed = Embed(
+                title=f"Elimination Executed — DB {self.year}",
+                description=(
+                    "The following players are **eliminated** (cannot buy/sell; admin override disabled):\n"
+                    + "\n".join(lines_now) +
+                    "\n\nEliminated players may still **transfer** hint points to support others (not self)."
+                ),
+                colour=BOT_COLOUR
+            )
+            self.disable_all_items()
+            await btn_inter.followup.send(embed=done_embed)
+
+        @button(label="Cancel", style=ButtonStyle.secondary)
+        async def cancel(self, btn: Button, btn_inter: Interaction):
+            await btn_inter.response.send_message("Elimination canceled.", ephemeral=True)
+            self.disable_all_items()
+
+        def disable_all_items(self):
+            for child in self.children:
+                child.disabled = True
+
+    view = ElimCutView(OWNER_ID, ry, candidates)
+    await interaction.followup.send(embed=embed, view=view)
 #===================================================
 @bot.message_command(name="Get Unix timestamp")
 async def command_rac_time(interaction: Interaction, sent_message: Message):

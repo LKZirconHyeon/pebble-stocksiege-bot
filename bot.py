@@ -999,6 +999,11 @@ async def signup_join(
     if not interaction.response.is_done():
         await interaction.response.defer()  # public
 
+    settings = await _get_signup_settings()
+    if bool(settings.get("started")):
+        await interaction.followup.send("🔒 Signups are locked — the game has already started.")
+        return
+
     # 2) Collections & capacity check
     players_db = db_client.players
     signups_col = players_db.signups

@@ -697,6 +697,8 @@ def _portfolio_totals(items_cfg: dict, portfolio: dict) -> tuple[int, int]:
         price = int(items_cfg[code]["price"])
         valuation += q * price
     return cash, cash + valuation
+
+
 # Base Format Layers
 
 
@@ -741,6 +743,19 @@ def _load_help_pages(kind: str) -> tuple[list[str] | None, str]:
     if txt is None:
         return None, _help_title(kind)
     return _chunk_text(txt), _help_title(kind)
+
+def _md_escape(s: str) -> str:
+    """Escape Discord markdown so underscores etc. show literally."""
+    if s is None:
+        return ""
+    return (str(s)
+            .replace("\\", "\\\\")
+            .replace("_", "\\_")
+            .replace("*", "\\*")
+            .replace("`", "\\`")
+            .replace("~", "\\~")
+            .replace("|", "\\|")
+            .replace(">", "\\>"))
 # Help Format Layers
 
 
@@ -993,6 +1008,25 @@ async def signup_join(
         )
         return
 
+    # --- Duplicate checks (case-insensitive for name, normalized for HEX) ---
+    hex_norm = norm_hex.upper()  # '#RRGGBB' 형태라고 가정 (_normalize_hex 사용했다면 일관)
+    
+    dup_name = await signups_col.find_one(
+        {"color_name": {"$regex": f"^{re.escape(clean_name)}$", "$options": "i"}}
+    )
+    if dup_name:
+        await interaction.followup.send(
+            "❌ This color name is already taken. Choose a different name."
+        )
+        return
+    
+    dup_hex = await signups_col.find_one({"color_hex": {"$regex": f"^{re.escape(hex_norm)}$", "$options": "i"}})
+    if dup_hex:
+        await interaction.followup.send(
+            "❌ This HEX code is already used by another player. Choose a different HEX."
+        )
+        return
+
     # 6) Create signup record (user_id is stored but not displayed)
     await signups_col.insert_one({
         "_id": user_id,
@@ -1061,8 +1095,15 @@ async def signup_view(interaction: Interaction):
     signups_col = players_db.signups
 
     lines = []
-    async for p in signups_col.find({}, projection={"user_name": 1, "color_name": 1, "color_hex": 1}).sort("signup_time", 1):
-        lines.append(f"{p.get('user_name','(unknown)')} - {p.get('color_name','?')} - {p.get('color_hex','?')}")
+    cursor = signups_col.find(
+        {}, projection={"user_name": 1, "color_name": 1, "color_hex": 1, "signup_time": 1}
+    ).sort("signup_time", 1)
+    
+    async for d in cursor:
+        uname = _md_escape(d.get("user_name", "(unknown)"))
+        cname = _md_escape(d.get("color_name", "?"))
+        chex  = _md_escape(d.get("color_hex", "?"))
+        lines.append(f"{uname} — {cname} — `{chex}`")
 
     roster = "\n".join(lines) if lines else "_No signups yet_"
     embed = Embed(
@@ -1307,6 +1348,10 @@ async def signup_config(interaction: Interaction):
     signup_doc = await signups_col.find_one({"_id": user_id})
     settings = await _get_signup_settings()
 
+    # Current game mode & min player rule
+    cur_mode = await _get_game_mode()  # "classic" | "apocalypse" | "elimination"
+    MIN_START_PLAYERS = 16 if cur_mode in ("classic", "apocalypse") else MAX_PLAYERS
+
     cur_count = await signups_col.count_documents({})
     slots_left = max(0, MAX_PLAYERS - cur_count)
     locked = bool(settings.get("started"))
@@ -1319,28 +1364,31 @@ async def signup_config(interaction: Interaction):
 
     lock_line = "🔒 **Game Started** — signups & edits are locked." if locked else "🟢 Signups are **open**."
     slots_line = f"**Slots:** {cur_count} / {MAX_PLAYERS}" + (f"  •  ({slots_left} left)" if not locked else "")
+    mode_line = f"**Mode:** `{cur_mode}`  •  **Min to start:** {MIN_START_PLAYERS}"
 
     embed = Embed(
         title="Signup — Configuration",
-        description=f"{lock_line}\n{slots_line}\n\n{summary}",
+        description=f"{lock_line}\n{slots_line}\n{mode_line}\n\n{summary}",
         colour=BOT_COLOUR
     )
 
     class SignupPanel(View):
-        """Self edit + owner tools (remove / toggle start / edit others)."""
+        """Self edit + owner start/lock toggle (+ Close)."""
         def __init__(self, owner_id: int, started: bool, user_has_signup: bool,
-                     cur_count: int, slots_left: int):
+                     cur_count: int, slots_left: int, min_required: int, mode: str):
             super().__init__(timeout=600)
             self.owner_id = owner_id
             self.started = started
             self.user_has_signup = user_has_signup
             self.cur_count = cur_count
             self.slots_left = slots_left
+            self.min_required = min_required
+            self.mode = mode
 
-            # --- Self help (anyone) ---
+            # --- Help (anyone) ---
             join_btn = Button(style=ButtonStyle.primary, label="How do I sign up?")
             join_btn.callback = self.on_join_help
-            join_btn.disabled = self.started  # when started, signups closed
+            join_btn.disabled = self.started
             self.add_item(join_btn)
 
             # --- Self edit (only if signed up & not started) ---
@@ -1349,21 +1397,8 @@ async def signup_config(interaction: Interaction):
             edit_btn.disabled = not (self.user_has_signup and not self.started)
             self.add_item(edit_btn)
 
-            # --- Owner: remove player ---
-            rem_btn = Button(style=ButtonStyle.danger, label="Remove Player (Owner)", emoji="🗑️")
-            rem_btn.callback = self.on_admin_remove
-            rem_btn.disabled = (interaction.user.id != OWNER_ID)
-            self.add_item(rem_btn)
-
-            # --- Owner: edit other player's color/HEX ---
-            owner_edit_btn = Button(style=ButtonStyle.secondary, label="Edit Player (Owner)", emoji="🛠️")
-            owner_edit_btn.callback = self.on_admin_edit
-            # disabled if not owner OR game started (locked)
-            owner_edit_btn.disabled = (interaction.user.id != OWNER_ID) or self.started
-            self.add_item(owner_edit_btn)
-
-            # --- Owner: start/stop (lock/unlock) ---
-            can_start = (not self.started) and (self.cur_count >= MAX_PLAYERS)
+            # --- Owner: Start/Unlock (min rule applied) ---
+            can_start = (not self.started) and (self.cur_count >= self.min_required)
             gs_label = "Start Game (Lock Signups)" if not self.started else "Unlock Signups"
             gs_emoji = "🚀" if not self.started else "🔓"
             start_btn = Button(style=ButtonStyle.success if not self.started else ButtonStyle.secondary,
@@ -1371,6 +1406,11 @@ async def signup_config(interaction: Interaction):
             start_btn.callback = self.on_toggle_start
             start_btn.disabled = (interaction.user.id != OWNER_ID) or (not self.started and not can_start)
             self.add_item(start_btn)
+
+            # --- Close (just remove components) ---
+            close_btn = Button(style=ButtonStyle.secondary, label="Close", emoji="❌")
+            close_btn.callback = self.on_close
+            self.add_item(close_btn)
 
         async def on_join_help(self, btn_inter: Interaction):
             await btn_inter.response.send_message(
@@ -1391,12 +1431,12 @@ async def signup_config(interaction: Interaction):
                         label="Color Name (letters & spaces, 1~20)",
                         required=True,
                         max_length=20,
-                        default_value=signup_doc["color_name"],
+                        default_value=signup_doc["color_name"] if signup_doc else "",
                     )
                     self.color_hex = TextInput(
                         label="HEX (e.g., #FF00AA or FF00AA)",
                         required=True,
-                        default_value=signup_doc["color_hex"],
+                        default_value=signup_doc["color_hex"] if signup_doc else "",
                     )
                     self.add_item(self.color_name)
                     self.add_item(self.color_hex)
@@ -1423,90 +1463,11 @@ async def signup_config(interaction: Interaction):
                     await signups_col.update_one(
                         {"_id": user_id},
                         {"$set": {"color_name": name, "color_hex": norm,
-                                  "signup_time": signup_doc.get("signup_time")}}
+                                  "signup_time": signup_doc.get("signup_time") if signup_doc else _now_ts()}}
                     )
                     await modal_inter.response.send_message(f"✅ Updated: **{name}** `{norm}`", ephemeral=True)
 
             await btn_inter.response.send_modal(EditModal())
-
-        async def on_admin_edit(self, btn_inter: Interaction):
-            """Owner: edit another player's color/HEX (locked when game started)."""
-            if btn_inter.user.id != self.owner_id:
-                await btn_inter.response.send_message("❌ Owner only.", ephemeral=True)
-                return
-            if self.started:
-                await btn_inter.response.send_message("🔒 Locked. Unlock first to edit players.", ephemeral=True)
-                return
-
-            # Build player list
-            options = []
-            async for s in signups_col.find({}, {"_id": 1, "user_name": 1, "color_name": 1}):
-                label = f"{s.get('user_name','(unknown)')} — {s.get('color_name','')}"
-                options.append(SelectOption(label=label[:100], value=s["_id"]))
-            if not options:
-                await btn_inter.response.send_message("No one has signed up.", ephemeral=True)
-                return
-
-            select = Select(placeholder="Choose a player to edit…", min_values=1, max_values=1, options=options)
-
-            async def on_select(select_inter: Interaction):
-                target_uid = select.values[0]
-                target = await signups_col.find_one({"_id": target_uid})
-                if not target:
-                    await select_inter.response.edit_message(content="❌ Player not found.", view=None)
-                    return
-
-                class AdminEditModal(Modal):
-                    def __init__(self, tdoc: dict):
-                        super().__init__(f"Edit Player — {tdoc.get('user_name','(unknown)')}")
-                        self.color_name = TextInput(
-                            label="Color Name (letters & spaces, 1~20)",
-                            required=True,
-                            max_length=20,
-                            default_value=tdoc.get("color_name",""),
-                        )
-                        self.color_hex = TextInput(
-                            label="HEX (e.g., #FF00AA or FF00AA)",
-                            required=True,
-                            default_value=tdoc.get("color_hex",""),
-                        )
-                        self.add_item(self.color_name)
-                        self.add_item(self.color_hex)
-
-                    async def callback(self, modal_inter: Interaction):
-                        name = self.color_name.value.strip()
-                        hexv = self.color_hex.value.strip()
-
-                        if not COLOR_NAME_RE.fullmatch(name):
-                            await modal_inter.response.send_message(
-                                "❌ Invalid color name. Use only English letters and spaces, up to 20 characters.",
-                                ephemeral=True
-                            )
-                            return
-
-                        norm = _normalize_hex(hexv)
-                        if norm is None:
-                            await modal_inter.response.send_message(
-                                "❌ Invalid HEX code. Provide a 6-digit HEX like `#RRGGBB`.",
-                                ephemeral=True
-                            )
-                            return
-
-                        await signups_col.update_one(
-                            {"_id": target_uid},
-                            {"$set": {"color_name": name, "color_hex": norm,
-                                      "signup_time": target.get("signup_time")}}
-                        )
-                        await modal_inter.response.send_message(
-                            f"✅ Updated `<@{target_uid}>`: **{name}** `{norm}`", ephemeral=True
-                        )
-
-                await select_inter.response.send_modal(AdminEditModal(target))
-
-            select.callback = on_select
-            v = View(timeout=300)
-            v.add_item(select)
-            await btn_inter.response.send_message("Select a player to edit:", view=v, ephemeral=True)
 
         async def on_toggle_start(self, btn_inter: Interaction):
             if btn_inter.user.id != self.owner_id:
@@ -1514,9 +1475,10 @@ async def signup_config(interaction: Interaction):
                 return
 
             live_count = await signups_col.count_documents({})
-            if not self.started and live_count < MAX_PLAYERS:
+            if not self.started and live_count < self.min_required:
                 await btn_inter.response.send_message(
-                    f"⏳ Need a full roster to start: {live_count}/{MAX_PLAYERS}.",
+                    f"⏳ Need at least **{self.min_required}** players to start "
+                    f"(current: {live_count}/{self.min_required}).",
                     ephemeral=True
                 )
                 return
@@ -1528,53 +1490,54 @@ async def signup_config(interaction: Interaction):
             live_left = max(0, MAX_PLAYERS - live_count)
             lock_line = "🔒 **Game Started** — signups & edits are locked." if new_state else "🟢 Signups are **open**."
             slots_line = f"**Slots:** {live_count} / {MAX_PLAYERS}" + (f"  •  ({live_left} left)" if not new_state else "")
-            new_view = SignupPanel(self.owner_id, self.started, self.user_has_signup, live_count, live_left)
+            mode_line = f"**Mode:** `{self.mode}`  •  **Min to start:** {self.min_required}"
+            new_view = SignupPanel(self.owner_id, self.started, self.user_has_signup, live_count, live_left,
+                                   self.min_required, self.mode)
             await btn_inter.response.edit_message(
                 embed=Embed(
                     title="Signup — Configuration",
-                    description=f"{lock_line}\n{slots_line}\n\n{summary}",
+                    description=f"{lock_line}\n{slots_line}\n{mode_line}\n\n{summary}",
                     colour=BOT_COLOUR
                 ),
                 view=new_view
             )
 
-        async def on_admin_remove(self, btn_inter: Interaction):
-            if btn_inter.user.id != self.owner_id:
-                await btn_inter.response.send_message("❌ Owner only.", ephemeral=True)
-                return
-            if self.started:
-                await btn_inter.response.send_message("🔒 Locked. Unlock first to remove.", ephemeral=True)
-                return
-
-            options = []
-            async for s in signups_col.find({}, {"_id": 1, "user_name": 1, "color_name": 1}):
-                label = f"{s.get('user_name','(unknown)')} — {s.get('color_name','')}"
-                options.append(SelectOption(label=label[:100], value=s["_id"]))
-            if not options:
-                await btn_inter.response.send_message("No one has signed up.", ephemeral=True)
-                return
-
-            select = Select(placeholder="Choose a player to remove…", min_values=1, max_values=1, options=options)
-
-            async def on_select(select_inter: Interaction):
-                target_uid = select.values[0]
-                deleted = 0
-                deleted += (await signups_col.delete_one({"_id": target_uid})).deleted_count
-                deleted += (await db_client.hint_points.balance.delete_one({"_id": target_uid})).deleted_count
-                deleted += (await db_client.market.portfolios.delete_one({"_id": target_uid})).deleted_count
-                await select_inter.response.edit_message(
-                    content=f"✅ Removed `<@{target_uid}>` (deleted docs total: {deleted}).",
-                    view=None
-                )
-
-            select.callback = on_select
-            v = View(timeout=300)
-            v.add_item(select)
-            await btn_inter.response.send_message("Select a player to remove:", view=v, ephemeral=True)
+        async def on_close(self, btn_inter: Interaction):
+            for c in self.children:
+                c.disabled = True
+            await btn_inter.response.edit_message(view=None)
 
     await interaction.followup.send(
         embed=embed,
-        view=SignupPanel(OWNER_ID, locked, signup_doc is not None, cur_count, slots_left)
+        view=SignupPanel(OWNER_ID, locked, signup_doc is not None, cur_count, slots_left, MIN_START_PLAYERS, cur_mode)
+    )
+
+# ============= Subcommand "remove" of "signup" (OWNER only) =============
+@signup_cmd.subcommand(
+    name="remove",
+    description="OWNER: Remove a signed-up player and purge their data."
+)
+@guard(require_private=False, public=True, owner_only=True)
+async def signup_remove(
+    interaction: Interaction,
+    user: Member = SlashOption(description="Player to remove", required=True),
+    confirm: str = SlashOption(description='Type "CONFIRM" to proceed.', required=True)
+):
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
+    if confirm != "CONFIRM":
+        await interaction.followup.send("❌ Type `CONFIRM` to proceed.")
+        return
+
+    uid = str(user.id)
+    signups_col = db_client.players.signups
+    deleted = 0
+    deleted += (await signups_col.delete_one({"_id": uid})).deleted_count
+    deleted += (await db_client.hint_points.balance.delete_one({"_id": uid})).deleted_count
+    deleted += (await db_client.market.portfolios.delete_one({"_id": uid})).deleted_count
+
+    await interaction.followup.send(
+        f"✅ Removed {user.mention} (deleted docs total: **{deleted}**)."
     )
 #===================================================
 

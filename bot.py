@@ -42,6 +42,27 @@ HELP_FILE_PLAYER = "readme_player.txt"
 HELP_FILE_ADMIN  = "readme_admin.txt"
 HELP_PAGE_LIMIT  = 4000  # stay under embed description limit
 
+
+# Market View Allowed Channels
+def _get_int_env(key: str) -> int | None:
+    v = os.getenv(key)
+    try:
+        return int(v) if v else None
+    except ValueError:
+        return None
+
+ALLOWED_MKVIEW_CHANNEL_IDS: set[int] = {
+    x for x in (
+        _get_int_env("MKVIEW_COUNCIL_ID"),
+        _get_int_env("MKVIEW_GENERAL_ID"),
+        _get_int_env("MKVIEW_STOCKS_ID"),
+    ) if x
+}
+
+def _channel_or_parent_id(ch) -> int | None:
+    return ch.id if getattr(ch, "parent", None) is None else ch.parent.id
+
+
 # Base Format Layers
 def _env_int(name: str) -> int | None:
     """Read a Discord snowflake from env; return None if missing/invalid."""
@@ -300,11 +321,27 @@ def _in_game_category(inter: Interaction) -> bool:
     return getattr(pcat, "id", None) == ALLOWED_GAME_CATEGORY_ID
 
 from functools import wraps
-def guard(*, require_private: bool, public: bool, require_unlocked: bool = False, owner_only: bool = False):
+from typing import Iterable, Optional
+
+def _channel_or_parent_id(ch) -> int | None:
+    try:
+        return ch.id if getattr(ch, "parent", None) is None else ch.parent.id
+    except Exception:
+        return getattr(ch, "id", None)
+
+def guard(
+    *,
+    require_private: bool,
+    public: bool,
+    require_unlocked: bool = False,
+    owner_only: bool = False,
+    allow_channel_ids: Optional[Iterable[int]] = None,
+):
+    allow = set(allow_channel_ids or ())
+
     def deco(func):
         @wraps(func)
         async def wrapper(interaction: Interaction, *args, **kwargs):
-            # Owner gate (public error)
             if owner_only and interaction.user.id != OWNER_ID:
                 if not interaction.response.is_done():
                     await interaction.response.send_message("❌ Owner only.", ephemeral=False)
@@ -312,8 +349,10 @@ def guard(*, require_private: bool, public: bool, require_unlocked: bool = False
                     await interaction.followup.send("❌ Owner only.")
                 return
 
-            # Private category gate (public error)
-            if require_private and not _in_game_category(interaction):
+            cid = _channel_or_parent_id(interaction.channel)
+            whitelisted = (cid in allow)
+
+            if require_private and not whitelisted and not _in_game_category(interaction):
                 msg = f"❌ This command can only be used in channels under <#{ALLOWED_GAME_CATEGORY_ID}>."
                 if not interaction.response.is_done():
                     await interaction.response.send_message(msg, ephemeral=False)
@@ -321,11 +360,9 @@ def guard(*, require_private: bool, public: bool, require_unlocked: bool = False
                     await interaction.followup.send(msg)
                 return
 
-            # Force public defer if requested
             if public and not interaction.response.is_done():
                 await interaction.response.defer(ephemeral=False)
 
-            # Global “interaction grant” (trading & hints) lock
             if require_unlocked and await _trading_locked():
                 await interaction.followup.send("❌ Trading and hints are currently locked by the host.")
                 return
@@ -1831,9 +1868,10 @@ async def market_cmd(interaction: Interaction):
     name="view",
     description="View current market items (A–H)."
 )
-@guard(require_private=True, public=True)
-async def market_view(interaction: Interaction):
+@guard(require_private=True, public=True, allow_channel_ids=ALLOWED_MKVIEW_CHANNEL_IDS)
+async def market_view(interaction: Interaction): 
     cfg = await _get_market_config()
+    
     if not cfg or "items" not in cfg:
         await interaction.followup.send("❌ Market is not configured yet.")
         return

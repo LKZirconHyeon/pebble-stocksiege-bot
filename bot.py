@@ -2124,15 +2124,6 @@ async def market_purchase(
             f"❌ Not enough cash. Need {total_cost}, you have {cash_now} (debt not allowed)."
         )
         return
-
-    # Elimination gate: only enforce in elimination mode
-    if await _mode_is("elimination"):
-        is_elim, elim_year = await _is_eliminated_user(str(interaction.user.id))  # self-trade
-        if is_elim:
-            await interaction.followup.send(
-                "⛔ This portfolio has been **eliminated** and cannot trade (buy/sell)."
-            )
-            return
     
     # Apply updates (atomic per user doc)
     for code, qty in add_map.items():
@@ -2164,11 +2155,11 @@ async def market_admin_purchase(
     interaction: Interaction,
     user: Member = SlashOption(description="Player to purchase for", required=True),
     orders: str = SlashOption(
-        description="Pairs like 'A 10, C 5' or names 'Apple 3' (comma/|/; or newline separated).",
+        description="Pairs like 'A 10, C 5' or names 'Apple 3' (comma/|/; or newline separated). Also supports '10 A'.",
         required=True
     ),
 ):
-    # Load config (and optional private category gate)
+    # Load config
     cfg = await _get_market_config()
     if not cfg or "items" not in cfg:
         await interaction.followup.send("❌ Market is not configured yet.")
@@ -2185,35 +2176,48 @@ async def market_admin_purchase(
         )
         return
 
-    # ⛔ Elimination gate (self)
+    # ⛔ Elimination gate (admin override 금지)
     if await _block_if_eliminated(interaction, uid):
         return
-    
-    # Parse orders → [(identifier, qty)]
+
+    # 🧊 Freeze gate (NEXT 연도 분배 처리 중이면 거래 금지 — buy와 동일)
+    use_next_global = bool(cfg.get("use_next_for_total"))
+    next_year = int(cfg["next_year"]) if cfg.get("next_year") is not None else None
+    if use_next_global and next_year is not None and pf.get("frozen_year") == next_year:
+        await interaction.followup.send(
+            f"🧊 {user.mention} is currently **frozen for Y{next_year}**. Inventory is being resolved."
+        )
+        return
+
+    # ✅ 범용 파서로 교체 (수량-먼저도 허용)
     try:
-        pairs = _parse_admin_orders(orders)
+        raw_pairs = _parse_orders(orders)  # -> list[(ident, qty)]
     except ValueError as e:
         await interaction.followup.send(f"❌ {e}")
         return
+    if not raw_pairs:
+        await interaction.followup.send("❌ No valid orders found.")
+        return
 
-    # Resolve identifiers to item codes and validate; price at CURRENT price
+    # Resolve & validate
     adds: dict[str, int] = {}
     total_cost = 0
     holdings = dict(pf.get("holdings") or {})
     cash = int(pf.get("cash", 0))
 
-    for ident, qty in pairs:
+    for ident, qty in raw_pairs:
+        if qty <= 0:
+            await interaction.followup.send("❌ Quantities must be positive integers.")
+            return
         code = _resolve_item_code(items, ident)
         if not code:
             await interaction.followup.send(f"❌ Unknown item: `{ident}`")
             return
-        if qty <= 0:
-            await interaction.followup.send("❌ Quantities must be positive integers.")
-            return
 
-        price = int(items[code]["price"])  # Classic: purchases use CURRENT price
+        price = int(items[code]["price"])  # CURRENT price
         cur_qty = int(holdings.get(code, 0))
-        if cur_qty + qty > MAX_ITEM_UNITS:
+        new_qty = cur_qty + adds.get(code, 0) + qty
+        if new_qty > MAX_ITEM_UNITS:
             await interaction.followup.send(
                 f"❌ Holding limit exceeded for {code}. Max {MAX_ITEM_UNITS}."
             )

@@ -2735,16 +2735,39 @@ async def stock_change_liquidate(
     use_next = bool(cfg.get("use_next_for_total"))
 
     # Result year (must be set by reveal step)
-    result_year = int(cfg.get("next_year")) if "next_year" in cfg else None
-    if result_year is None:
+    raw_year = cfg.get("next_year")
+    if raw_year is None:
         await interaction.followup.send("❌ Cannot liquidate: no `next_year` set. Reveal prices first.")
         return
+    result_year = int(raw_year)
+
+    # Roll NEXT -> CURRENT prices
+    from copy import deepcopy
+    new_items = deepcopy(items)
+
+    for code in ITEM_CODES:
+        np = new_items.get(code, {}).get("next_price")
+        if np is not None:
+            new_items[code]["price"] = int(np)
+            new_items[code].pop("next_price", None)
 
     # Persist 'last_result_year' marker for downstream logic
+    new_items = dict(items)
+    for code in ITEM_CODES:
+        np = new_items[code].get("next_price")
+        if np is not None:
+            new_items[code]["price"] = int(np)
+            new_items[code].pop("next_price", None)
+
     await db_client.market.config.update_one(
         {"_id": "current"},
-        {"$set": {"last_result_year": int(result_year), "updated_at": _now_ts()}},
-        upsert=True
+        {"$set": {
+            "items": new_items,
+            "use_next_for_total": False,
+            "last_result_year": int(result_year),
+            "next_year": int(result_year) + 1,
+            "updated_at": _now_ts(),
+        }},
     )
 
     # Determine game mode (apocalypse burns unspent cash)
@@ -2809,6 +2832,7 @@ async def stock_change_liquidate(
         f"All holdings set to 0; players' **Unspent Cash** now equals "
         f"{'their holdings value only (Unspent burned)' if is_apoc else 'their Total Cash'}."
         f"\n🧹 Snapshot housekeeping: purged **{purged}** older snapshot(s)."
+        f"📈 Rolled NEXT → CURRENT and advanced to **DB {int(result_year)+1}**."
         f"{apoc_line}"
     )
 

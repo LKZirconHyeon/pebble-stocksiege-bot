@@ -135,6 +135,35 @@ def _fmt_change_line(old: int, new: int) -> str:
         return f"{fmt_price(old)} → {fmt_price(new)}  =  {('+' if delta>=0 else '')}{fmt_price(delta)} ({pct:+.2f}%)"
     return f"{fmt_price(old)} → {fmt_price(new)}  =  {('+' if delta>=0 else '')}{fmt_price(delta)}"
 
+from cramesia_SS.config import ALLOWED_GAME_CATEGORY_ID  # add this
+
+def _category_ok(inter: Interaction) -> bool:
+    """True if command is used in the allowed category (or restriction is disabled)."""
+    try:
+        cat_id = int(ALLOWED_GAME_CATEGORY_ID or 0)
+    except Exception:
+        cat_id = 0
+    if cat_id <= 0:
+        return True  # restriction disabled
+    # in guild channels, check category id
+    return getattr(inter.channel, "category_id", None) == cat_id
+
+async def _enforce_market_channel(inter: Interaction) -> bool:
+    """Send a polite error if channel is not allowed. Return True if OK to proceed."""
+    if _category_ok(inter):
+        return True
+    try:
+        msg = "❌ This command can only be used in the designated Stock Siege category."
+        # if you want to show the category mention, uncomment (Discord doesn’t support category mentions):
+        # msg += f" (<#{ALLOWED_GAME_CATEGORY_ID}>)"
+        if inter.response.is_done():
+            await inter.followup.send(msg, ephemeral=True)
+        else:
+            await inter.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
+    return False
+
 # ===================== Cog =====================
 def setup(bot: commands.Bot):
 
@@ -171,6 +200,10 @@ def setup(bot: commands.Bot):
     @market_root.subcommand(name="inv", description="View your portfolio with total value.")
     @guard(require_private=False, public=True)
     async def market_portfolio(inter: Interaction):
+
+        if not await _enforce_market_channel(inter):
+            return
+        
         if not inter.response.is_done():
             await inter.response.defer()
 
@@ -246,8 +279,12 @@ def setup(bot: commands.Bot):
         inter: Interaction,
         orders: str = SlashOption(description="Buy items using this command! Use comma (,) or pipe (|) to separate items.", required=True),
     ):
+        if not await _enforce_market_channel(inter):
+            return
+        
         if not inter.response.is_done():
             await inter.response.defer()
+        
         uid = str(inter.user.id)
         pf = await _ports().find_one({"_id": uid})
         if not pf:
@@ -302,8 +339,13 @@ def setup(bot: commands.Bot):
         inter: Interaction,
         orders: str = SlashOption(description="Sell items using this command! Use comma (,) or pipe (|) to separate items.", required=True),
     ):
+        
+        if not await _enforce_market_channel(inter):
+            return
+        
         if not inter.response.is_done():
             await inter.response.defer()
+
         uid = str(inter.user.id)
         pf = await _ports().find_one({"_id": uid})
         if not pf:
@@ -350,6 +392,7 @@ def setup(bot: commands.Bot):
     @market_root.subcommand(name="cash_rank", description="Show ranking by Total Cash.")
     @guard(require_private=False, public=True)
     async def market_cash_rank(inter: Interaction):
+        
         if not inter.response.is_done():
             await inter.response.defer()
 
@@ -381,8 +424,13 @@ def setup(bot: commands.Bot):
     @market_root.subcommand(name="admin_buy", description="OWNER: Buy items for a player.")
     @guard(require_private=True, public=True, require_unlocked=True, owner_only=True)
     async def market_admin_buy(inter: Interaction, user: Member, orders: str):
+        
+        if not await _enforce_market_channel(inter):
+            return
+        
         if not inter.response.is_done():
             await inter.response.defer()
+        
         cfg = await _get_config(); items = cfg["items"]
         uid = str(user.id)
         use_next = bool((await _get_config()).get("use_next_for_total"))
@@ -421,8 +469,13 @@ def setup(bot: commands.Bot):
     @market_root.subcommand(name="admin_sell", description="OWNER: Sell items for a player.")
     @guard(require_private=True, public=True, require_unlocked=True, owner_only=True)
     async def market_admin_sell(inter: Interaction, user: Member, orders: str):
+        
+        if not await _enforce_market_channel(inter):
+            return
+        
         if not inter.response.is_done():
             await inter.response.defer()
+        
         cfg = await _get_config(); items = cfg["items"]
         uid = str(user.id)
         use_next = bool((await _get_config()).get("use_next_for_total"))
@@ -466,6 +519,10 @@ def setup(bot: commands.Bot):
     @market_root.subcommand(name="admin_inv", description="OWNER: View someone else's portfolio with totals.")
     @guard(require_private=False, public=True, owner_only=True)
     async def market_admin_inv(inter: Interaction, user: Member = SlashOption(description="Player", required=True)):
+        
+        if not await _enforce_market_channel(inter):
+            return
+        
         if not inter.response.is_done():
             await inter.response.defer()
 
@@ -557,6 +614,10 @@ def setup(bot: commands.Bot):
         inter: Interaction,
         user: Member = SlashOption(description="(Owner) Clear this player's inventory", required=False, default=None),
     ):
+        
+        if not await _enforce_market_channel(inter):
+            return
+        
         if not inter.response.is_done():
             await inter.response.defer()
 

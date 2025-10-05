@@ -45,7 +45,7 @@ def _price_with_change(base_price: int, percent: int) -> int:
 async def _get_market_config() -> dict | None:
     return await _cfg().find_one({"_id": "current"})
 
-async def _item_label(code: str, items_cfg: dict) -> str:
+def _item_label(code: str, items_cfg: dict) -> str:
     info = (items_cfg or {}).get(code, {})
     return f"{code} — {info.get('name', code)}"
 
@@ -132,7 +132,8 @@ def setup(bot: commands.Bot):
         year: int = SlashOption(description="Year the changes apply to", required=True),
     ):
         # behavior & validation as in monolith
-        await inter.response.defer(ephemeral=True)
+        if not inter.response.is_done():
+            await inter.response.defer(ephemeral=True)
 
         parts = [p.strip() for p in changes.split()]
         if len(parts) != 8:
@@ -165,32 +166,35 @@ def setup(bot: commands.Bot):
     @stock_change_cmd.subcommand(name="odds", description="Owner: compute odds from historical changes.")
     @guard(require_private=False, public=True, owner_only=True)
     async def stock_change_odds(inter: Interaction):
-        await inter.response.defer(ephemeral=True)
+        # defer once
+        if not inter.response.is_done():
+            await inter.response.defer(ephemeral=True)
 
+        # fetch changes & items
         years = [doc async for doc in _changes().find({})]
-        if not years:
-            return await inter.followup.send(
-                "There is no stock info in the database.\n"
-                "Either you did not set changes, or this is the start of a season (all 50%)."
-            )
-
         years.sort(key=lambda d: d["_id"])
-        r_years = years[:-1]                                 # R-hint excludes latest year
         items_cfg = (await _get_market_config() or {}).get("items", {})
 
-        r_info = ""
-        if r_years:
+        # R-hint (exclude latest year)
+        r_text = "No historical data yet."
+        if len(years) >= 2:
+            r_years = years[:-1]
             r_odds = calculate_odds(r_years)
-            r_info = "R-hint (excludes latest year changes)\n\n" + "\n".join(
-                f"{await _item_label(k, items_cfg)}: {v}%" for k, v in r_odds.items()
-            )
+            r_lines = [f"{_item_label(code, items_cfg)}: {r_odds.get(code, 50)}%" for code in ITEM_CODES]
+            r_text = "R-hint (excludes latest year changes)\n\n" + "\n".join(r_lines)
+        else:
+            r_text = "R-hint (excludes latest year changes)\n\nNo historical data yet."
 
-        owner_odds = calculate_odds(years)
-        owner_info = "Owner odds (includes latest year)\n\n" + "\n".join(
-            f"{await _item_label(k, items_cfg)}: {v}%" for k, v in owner_odds.items()
-        )
+        # Owner odds (include latest year)
+        if years:
+            owner = calculate_odds(years)
+            owner_lines = [f"{_item_label(code, items_cfg)}: {owner.get(code, 50)}%" for code in ITEM_CODES]
+        else:
+            owner_lines = [f"{_item_label(code, items_cfg)}: 50%" for code in ITEM_CODES]
 
-        await inter.followup.send((r_info + ("\n\n" if r_info else "") + owner_info) or "No data.")
+        owner_text = "Owner odds (includes latest year)\n\n" + "\n".join(owner_lines)
+
+        await inter.followup.send(f"{r_text}\n\n{owner_text}")
 
     # ---------- /stock_change reveal_next ----------------------------------
     @stock_change_cmd.subcommand(
@@ -203,7 +207,10 @@ def setup(bot: commands.Bot):
         year: int = SlashOption(description="Year to project", required=True),
         confirm: str = SlashOption(description="Type CONFIRM to proceed.", required=True),
     ):
-        await inter.response.defer(ephemeral=True)
+        # behavior & validation as in monolith
+        if not inter.response.is_done():
+            await inter.response.defer(ephemeral=True)
+        
         if confirm != "CONFIRM":
             return await inter.followup.send("❌ Type `CONFIRM` to proceed.")
 
@@ -267,7 +274,10 @@ def setup(bot: commands.Bot):
         inter: Interaction,
         year: int = SlashOption(description="Year to view", required=True),
     ):
-        await inter.response.defer(ephemeral=True)
+        # behavior & validation as in monolith
+        if not inter.response.is_done():
+            await inter.response.defer(ephemeral=True)
+
         doc = await _changes().find_one({"_id": int(year)})
         if not doc:
             return await inter.followup.send(f"❌ No changes found for {year}.")
@@ -290,7 +300,10 @@ def setup(bot: commands.Bot):
         inter: Interaction,
         confirm: str = SlashOption(description="Type CONFIRM to proceed.", required=True),
     ):
-        await inter.response.defer(ephemeral=True)
+        # behavior & validation as in monolith
+        if not inter.response.is_done():
+            await inter.response.defer(ephemeral=True)
+
         if confirm != "CONFIRM":
             return await inter.followup.send("❌ Type `CONFIRM` to proceed.")
 
@@ -382,7 +395,10 @@ def setup(bot: commands.Bot):
         inter: Interaction,
         confirm: str = SlashOption(description="Type REVERT to proceed.", required=True),
     ):
-        await inter.response.defer(ephemeral=True)
+        # behavior & validation as in monolith
+        if not inter.response.is_done():
+            await inter.response.defer(ephemeral=True)
+
         if confirm != "REVERT":
             return await inter.followup.send("❌ Type `REVERT` to proceed.")
 
@@ -437,8 +453,10 @@ def setup(bot: commands.Bot):
     @requires_mode("elimination", public=True)
     @guard(require_private=False, public=True, owner_only=True)
     async def stock_change_elim_cut(inter: Interaction):
+        
+        # behavior & validation as in monolith
         if not inter.response.is_done():
-            await inter.response.defer()
+            await inter.response.defer(ephemeral=True)
 
         ry = await _current_result_year()
         if ry is None:
@@ -510,8 +528,10 @@ def setup(bot: commands.Bot):
     )
     @guard(require_private=False, public=True, owner_only=True)
     async def stock_change_finalize(inter: Interaction):
+        
+        # behavior & validation as in monolith
         if not inter.response.is_done():
-            await inter.response.defer()
+            await inter.response.defer(ephemeral=True)
 
         ry = await _current_result_year()
         if ry != 11:

@@ -244,7 +244,7 @@ def setup(bot: commands.Bot):
     @guard(require_private=False, public=True, require_unlocked=True)
     async def market_buy(
         inter: Interaction,
-        orders: str = SlashOption(description="Orders string", required=True),
+        orders: str = SlashOption(description="Buy items using this command! Use comma (,) or pipe (|) to separate items.", required=True),
     ):
         if not inter.response.is_done():
             await inter.response.defer()
@@ -300,7 +300,7 @@ def setup(bot: commands.Bot):
     @guard(require_private=False, public=True, require_unlocked=True)
     async def market_sell(
         inter: Interaction,
-        orders: str = SlashOption(description="Orders string", required=True),
+        orders: str = SlashOption(description="Sell items using this command! Use comma (,) or pipe (|) to separate items.", required=True),
     ):
         if not inter.response.is_done():
             await inter.response.defer()
@@ -612,7 +612,7 @@ def setup(bot: commands.Bot):
     # ---- force_cash (owner only) -------------------------------------------
     @market_root.subcommand(
         name="force_cash",
-        description="OWNER: Empty holdings and force Unspent Cash to a value.",
+        description="OWNER: Empty holdings and force Unspent Cash to a value. USE THIS ONLY ON LAST RESORT.",
     )
     @guard(require_private=False, public=True, owner_only=True)
     async def market_force_cash(

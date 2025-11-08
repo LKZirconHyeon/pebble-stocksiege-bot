@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from typing import Union
+
+import nextcord
 from nextcord.ext import commands
-from nextcord import Interaction, AllowedMentions, Member, Embed, SlashOption
+from nextcord import Interaction, AllowedMentions, Member, Embed, SlashOption, User
+from nextcord.utils import escape_markdown, escape_mentions
 
 from cramesia_SS.db import db
 from cramesia_SS.config import OWNER_ID
 from cramesia_SS.constants import bot_colour
 from cramesia_SS.utils.time import now_ts
+from cramesia_SS.utils.colors import colour_from_hex
 from cramesia_SS.views.bank import (
     BankBalanceViewer,
     format_balance_embed,
@@ -17,12 +22,26 @@ from cramesia_SS.views.bank import (
 def _banks():
     return db.hint_points.balance
 
-def _no_bank_msg_for(mention: str) -> str:
-    return (
-        f"{mention} does not have a Hint Point Inventory.\n"
-        f"If you are the host, ask them to run /signup join."
-    )
+def _no_bank_msg_for(target: Union[Member, User, str]) -> str:
+    """
+    Return a safe 'no inventory' message that never pings users.
+    Accepts a Member/User or a string.
+    """
+    if isinstance(target, (Member, User)):
+        name = getattr(target, "global_name", None) or getattr(target, "display_name", None) or getattr(target, "name", None)
+        safe_name = escape_markdown(str(name))
+        return f"{safe_name} does not have a Hint Point Inventory."
+    return f"{escape_mentions(str(target))} does not have a Hint Point Inventory."
 
+async def _embed_colour_for(user) -> nextcord.Colour:
+    uid = str(getattr(user, "id", user))
+    doc = await db.players.signups.find_one({"_id": uid}, {"color_hex": 1})
+    hx = (doc or {}).get("color_hex") or "#000000"
+    try:
+        return colour_from_hex(hx)
+    except Exception:
+        return bot_colour()
+    
 # ==================== Cog ====================
 def setup(bot: commands.Bot):
     @bot.slash_command(name="hint_points", description="Manage hint points.", force_global=True)
@@ -44,7 +63,7 @@ def setup(bot: commands.Bot):
         col = _banks()
         bank = await col.find_one({"_id": str(user.id)})
         if bank is None:
-            return await inter.followup.send(_no_bank_msg_for(user.mention))
+            return await inter.followup.send(_no_bank_msg_for(user))
 
         balance = int(bank.get("balance", 0))
         new_balance = balance + int(hint_points)
@@ -65,10 +84,13 @@ def setup(bot: commands.Bot):
         existing = await col.find_one({"_id": str(user.id)})
         pages = format_history_pages(existing.get("history"))
         view = BankBalanceViewer(0, int(existing.get("balance", 0)), pages, user)
+        
+        emb = format_balance_embed(view)
+        emb.colour = await _embed_colour_for(user)
         await inter.followup.send(
             content=f"✅ Added **{hint_points}** hint point(s) to {user.mention}. "
                     f"New balance: **{new_balance}**.",
-            embed=format_balance_embed(view),
+            embed=emb,
             view=view,
             allowed_mentions=AllowedMentions(everyone=False, roles=False, users=[user]),
         )
@@ -88,7 +110,7 @@ def setup(bot: commands.Bot):
         col = _banks()
         bank = await col.find_one({"_id": str(user.id)})
         if bank is None:
-            return await inter.followup.send(_no_bank_msg_for(user.mention))
+            return await inter.followup.send(_no_bank_msg_for(user))
 
         balance = int(bank.get("balance", 0))
         if balance - hint_points < 0:
@@ -113,10 +135,12 @@ def setup(bot: commands.Bot):
         existing = await col.find_one({"_id": str(user.id)})
         pages = format_history_pages(existing.get("history"))
         view = BankBalanceViewer(0, int(existing.get("balance", 0)), pages, user)
+        emb = format_balance_embed(view)
+        emb.colour = await _embed_colour_for(user)
         await inter.followup.send(
             content=f"✅ Removed **{hint_points}** hint point(s) from {user.mention}. "
                     f"New balance: **{new_balance}**.",
-            embed=format_balance_embed(view),
+            embed=emb,
             view=view,
             allowed_mentions=AllowedMentions(everyone=False, roles=False, users=[user]),
         )
@@ -140,12 +164,12 @@ def setup(bot: commands.Bot):
         if send_bank is None:
             return await inter.followup.send(_no_bank_msg_for(inter.user.mention))
         if recv_bank is None:
-            return await inter.followup.send(_no_bank_msg_for(user.mention))
+            return await inter.followup.send(_no_bank_msg_for(user))
 
         send_balance = int(send_bank.get("balance", 0))
         if send_balance - hint_points < 0:
             return await inter.followup.send(
-                f"You can't just go into debt. You only have {send_balance} hint points."
+                f"You can't just go into debt. You only have {user} hint points."
             )
 
         t = now_ts()
@@ -177,14 +201,22 @@ def setup(bot: commands.Bot):
         }})
 
         # show recipient’s bank after transfer
-        recipient_latest = await col.find_one({"_id": str(user.id)})
-        pages = format_history_pages(recipient_latest.get("history"))
-        view = BankBalanceViewer(0, int(recipient_latest.get("balance", 0)), pages, user)
+        sender_new = send_balance - int(hint_points)
+        recv_new   = recv_balance + int(hint_points)
+
+        emb = Embed(
+            title="Hint Points Transferred",
+            description=(
+                f"**Sender**: {inter.user.mention} → **{sender_new} HP**\n"
+                f"**Recipient**: {user.mention} → **{recv_new} HP**"
+            ),
+            colour=await _embed_colour_for(inter.user)  # 보낸 사람 색 기준(원하면 user 사용 가능)
+        )
+
         await inter.followup.send(
             content=(f"✅ Transferred **{hint_points}** hint point(s) to {user.mention}. "
-                     f"Your new balance: **{send_balance - hint_points}**."),
-            embed=format_balance_embed(view),
-            view=view,
+                     f"Your new balance: **{sender_new}**."),
+            embed=emb,
             allowed_mentions=AllowedMentions(everyone=False, roles=False, users=[user]),
         )
 
@@ -206,7 +238,9 @@ def setup(bot: commands.Bot):
 
         pages = format_history_pages(existing.get("history"))
         view = BankBalanceViewer(0, int(existing.get("balance", 0)), pages, target)
-        await inter.followup.send(embed=format_balance_embed(view), view=view)
+        emb = format_balance_embed(view)
+        emb.colour = await _embed_colour_for(target)
+        await inter.followup.send(embed=emb, view=view)
 
     # ---- list (OWNER) ------------------------------------------------------
     @hint_points_cmd.subcommand(name="list", description="List everyone's balances. Owner-only.")

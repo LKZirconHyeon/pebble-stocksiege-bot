@@ -1,6 +1,7 @@
 # cramesia_SS/game/mode_main/ac_use_hint.py
 from __future__ import annotations
 
+import nextcord
 from nextcord.ext import commands
 from nextcord import Interaction, SlashOption
 
@@ -8,6 +9,8 @@ from cramesia_SS.db import db
 from cramesia_SS.constants import ITEM_CODES, ODDS, ODDS_APOC
 from cramesia_SS.utils.guards import guard, disallow_self_hint_when_eliminated
 from cramesia_SS.utils.time import now_ts
+from cramesia_SS.constants import bot_colour
+from cramesia_SS.utils.colors import colour_from_hex
 from cramesia_SS.services.market_math import calculate_odds
 from cramesia_SS.views.bank import (
     BankBalanceViewer,
@@ -48,7 +51,15 @@ def _apoc_bucket(pct: int) -> str:
         return "Medium"
     return "High"
 
-
+async def _embed_colour_for(user) -> nextcord.Colour:
+    uid = str(getattr(user, "id", user))
+    doc = await db.players.signups.find_one({"_id": uid}, {"color_hex": 1})
+    hx = (doc or {}).get("color_hex") or "#000000"
+    try:
+        return colour_from_hex(hx)
+    except Exception:
+        return bot_colour()
+    
 # ============================= Cog ===========================================
 def setup(bot: commands.Bot):
 
@@ -95,16 +106,24 @@ def setup(bot: commands.Bot):
         if int(bank.get("balance", 0)) < 1:
             pages = format_history_pages(bank.get("history"))
             view = BankBalanceViewer(0, int(bank.get("balance", 0)), pages, inter.user)
+            emb = format_balance_embed(view)
+            emb.colour = await _embed_colour_for(inter.user)
             await send(
                 f"You need 1 hint point to use an R hint. You only have {bank.get('balance', 0)} hint points.",
-                embed=format_balance_embed(view),
+                embed=emb,
                 view=view,
             )
             return
 
-        # compute odds
+        # compute odds (R-hint = history only, exclude the latest year)
         years = [doc async for doc in _changes().find({})]
-        odds = calculate_odds(years)
+        years.sort(key=lambda d: d["_id"])
+
+        if len(years) >= 2:
+            hist_years = years[:-1]                # drop latest
+            odds_map = calculate_odds(hist_years)
+        else:
+            odds_map = {code: 50 for code in ITEM_CODES}  # no history yet
 
         # deduct & persist
         bank["balance"] = int(bank.get("balance", 0)) - 1
@@ -117,12 +136,15 @@ def setup(bot: commands.Bot):
 
         # pretty output
         items_cfg = (await _get_market_config() or {}).get("items", {})
-        lines = [f"{_item_label(code, items_cfg)}: {odds.get(code, 50)}%" for code in ITEM_CODES]
+        lines = [f"{_item_label(code, items_cfg)}: {odds_map.get(code, 50)}%" for code in ITEM_CODES]
+
 
         bank["history"].sort(key=lambda x: x["time"], reverse=True)
         pages = format_history_pages(bank.get("history"))
         view = BankBalanceViewer(0, int(bank.get("balance", 0)), pages, inter.user)
-        await send("Used R-hint!\n\n" + "\n".join(lines), embed=format_balance_embed(view), view=view)
+        emb = format_balance_embed(view)
+        emb.colour = await _embed_colour_for(inter.user)
+        await send("Used R-hint!\n\n" + "\n".join(lines), embed=emb, view=view)
 
     # --------------------- LVL1 ---------------------------------------------
     @use_hint.subcommand(name="lvl1", description="Reveals the strength of change for a single stock. Costs 1 HP.")
@@ -183,7 +205,9 @@ def setup(bot: commands.Bot):
             bank["history"].sort(key=lambda x: x["time"], reverse=True)
             pages = format_history_pages(bank.get("history"))
             view = BankBalanceViewer(0, bal, pages, inter.user)
-            await send(f"You need {cost} hint point(s). You only have {bal}.", embed=format_balance_embed(view), view=view)
+            emb = format_balance_embed(view)
+            emb.colour = await _embed_colour_for(inter.user)
+            await send(f"You need {cost} hint point(s). You only have {bal}.", embed=emb, view=view)
             return
 
         bank["balance"] = bal - cost
@@ -194,7 +218,9 @@ def setup(bot: commands.Bot):
         bank["history"].sort(key=lambda x: x["time"], reverse=True)
         pages = format_history_pages(bank.get("history"))
         view = BankBalanceViewer(0, int(bank.get("balance", 0)), pages, inter.user)
-        await send(msg, embed=format_balance_embed(view), view=view)
+        emb = format_balance_embed(view)
+        emb.colour = await _embed_colour_for(inter.user)
+        await send(msg, embed=emb, view=view)
 
     # --------------------- LVL2 ---------------------------------------------
     @use_hint.subcommand(name="lvl2", description="Gives 2 possible changes for a stock. Costs 2 HP")
@@ -251,7 +277,9 @@ def setup(bot: commands.Bot):
             bank["history"].sort(key=lambda x: x["time"], reverse=True)
             pages = format_history_pages(bank.get("history"))
             view = BankBalanceViewer(0, bal, pages, inter.user)
-            await send(f"You need {cost} hint point(s). You only have {bal}.", embed=format_balance_embed(view), view=view)
+            emb = format_balance_embed(view)
+            emb.colour = await _embed_colour_for(inter.user)
+            await send(f"You need {cost} hint point(s). You only have {bal}.", embed=emb, view=view)
             return
 
         bank["balance"] = bal - cost
@@ -262,7 +290,9 @@ def setup(bot: commands.Bot):
         bank["history"].sort(key=lambda x: x["time"], reverse=True)
         pages = format_history_pages(bank.get("history"))
         view = BankBalanceViewer(0, int(bank.get("balance", 0)), pages, inter.user)
-        await send(msg, embed=format_balance_embed(view), view=view)
+        emb = format_balance_embed(view)
+        emb.colour = await _embed_colour_for(inter.user)
+        await send(msg, embed=emb, view=view)
 
     # --------------------- LVL3 ---------------------------------------------
     @use_hint.subcommand(name="lvl3", description="Shows whether a stock will increase or decrease. Costs 3 HP")
@@ -316,7 +346,9 @@ def setup(bot: commands.Bot):
             bank["history"].sort(key=lambda x: x["time"], reverse=True)
             pages = format_history_pages(bank.get("history"))
             view = BankBalanceViewer(0, bal, pages, inter.user)
-            await send(f"You need {cost} hint point(s). You only have {bal}.", embed=format_balance_embed(view), view=view)
+            emb = format_balance_embed(view)
+            emb.colour = await _embed_colour_for(inter.user)
+            await send(f"You need {cost} hint point(s). You only have {bal}.", embed=emb, view=view)
             return
 
         bank["balance"] = bal - cost
@@ -327,4 +359,6 @@ def setup(bot: commands.Bot):
         bank["history"].sort(key=lambda x: x["time"], reverse=True)
         pages = format_history_pages(bank.get("history"))
         view = BankBalanceViewer(0, int(bank.get("balance", 0)), pages, inter.user)
-        await send(msg, embed=format_balance_embed(view), view=view)
+        emb = format_balance_embed(view)
+        emb.colour = await _embed_colour_for(inter.user)
+        await send(msg, embed=emb, view=view)

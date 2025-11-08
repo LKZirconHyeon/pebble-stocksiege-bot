@@ -15,6 +15,34 @@ ODDS_APOC = {
     -40: 3, -50: 6, -60: 9, -70: 12, -75: 15, -80: 20,
 }
 
+# Detailed Odds
+HIGH_INC  = [100, 150, 200, 300, 400]
+MED_INC   = [40, 50, 60, 70, 80, 90]
+LOW_INC   = [5, 10, 15, 20, 25, 30]
+
+LOW_DEC   = [-5, -10, -15]
+MED_DEC   = [-20, -25, -30, -35, -40, -45]
+HIGH_DEC  = [-50, -60, -70, -75, -80]
+
+# Detailed Strength
+UP_TABLE = {
+    "LOW":  {v: 1 for v in LOW_INC},
+    "MED":  {v: 1 for v in MED_INC},
+    "HIGH": {v: 1 for v in HIGH_INC},
+}
+DOWN_TABLE = {
+    "LOW":  {v: 1 for v in LOW_DEC},
+    "MED":  {v: 1 for v in MED_DEC},
+    "HIGH": {v: 1 for v in HIGH_DEC},
+}
+ZERO_VALUES = [0]
+
+# === ETU 정책 ===
+ETU_ODDS_NEUTRAL_MIN = 41   # 41~59 제외
+ETU_ODDS_NEUTRAL_MAX = 59
+ETU_RATIOS = (3, 2, 1)      # LOW:MED:HIGH 비율 (해밀턴 배분)
+
+
 # --- item setup ---
 ITEM_CODES = list("ABCDEFGH")
 NORMAL_STOCK_CHANGES = tuple(ODDS.keys())

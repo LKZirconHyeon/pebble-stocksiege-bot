@@ -15,6 +15,8 @@ from cramesia_SS.utils.time import now_ts
 from cramesia_SS.utils.text import fmt_price
 from cramesia_SS.utils.colors import colour_from_hex
 
+from cramesia_SS.services.ratio_buy import (detect_ratio_mode, parse_ratio_orders, ratio_buy_plan)
+
 # ---------- collections ----------
 def _cfg():
     return db.market.config
@@ -277,60 +279,86 @@ def setup(bot: commands.Bot):
     @guard(require_private=False, public=True, require_unlocked=True)
     async def market_buy(
         inter: Interaction,
-        orders: str = SlashOption(description="Buy items using this command! Use comma (,) or pipe (|) to separate items.", required=True),
+        orders: str = SlashOption(
+            description="Buy items. Use ',' or '|' for normal; use ':' or ';' for ratio.",
+            required=True
+        ),
     ):
         if not await _enforce_market_channel(inter):
             return
-        
         if not inter.response.is_done():
             await inter.response.defer()
-        
+
         uid = str(inter.user.id)
         pf = await _ports().find_one({"_id": uid})
         if not pf:
             return await inter.followup.send("❌ You don't have an Inventory yet. Use `/signup join` first.")
-    
+
         cfg = await _get_config()
         items = cfg["items"]
-        use_next = bool((await _get_config()).get("use_next_for_total"))
-        try:
-            pairs = _parse_orders(orders)
-        except ValueError as e:
-            return await inter.followup.send(f"❌ {e}")
-    
+        use_next = bool(cfg.get("use_next_for_total"))
         cash = int(pf.get("cash", 0))
         holdings = dict(pf.get("holdings", {}) or {})
-        total_cost = 0
-        applied: list[str] = []
-    
-        for ident, qty in pairs:
-            code = _resolve_item_code(items, ident)
-            if not code:
-                return await inter.followup.send(f"❌ Unknown item: `{ident}`")
-            px = _shown_price(items[code], use_next)
-            cost = px * qty
-            total_cost += cost
-            new_qty = int(holdings.get(code, 0)) + qty
-            if new_qty > MAX_ITEM_UNITS:
-                return await inter.followup.send(f"❌ Max units per item is {MAX_ITEM_UNITS} (violated by {code}).")
-            holdings[code] = new_qty
-            applied.append(f"{code} × {qty} @ {fmt_price(px)} = {fmt_price(cost)}")
-    
-        if total_cost > cash:
-            return await inter.followup.send(
-                f"❌ Not enough cash. Need {fmt_price(total_cost)}, you have {fmt_price(cash)}."
+
+        try:
+            # ----- Ratio mode (':' or ';') -----
+            if detect_ratio_mode(orders):
+                if cash <= 0:
+                    return await inter.followup.send("❌ You have no Unspent Cash.")
+                pairs = parse_ratio_orders(orders)  # [(ident, weight), ...]
+                lines, new_holdings, spent = ratio_buy_plan(
+                    items_cfg=items, use_next=use_next,
+                    holdings_now=holdings, cash_now=cash, pairs=pairs,
+                )
+                if spent <= 0:
+                    return await inter.followup.send("❌ Nothing could be purchased with the given ratios.")
+                new_cash = cash - spent
+                await _ports().update_one(
+                    {"_id": uid},
+                    {"$set": {"cash": new_cash, "holdings": new_holdings, "updated_at": now_ts()},
+                     "$push": {"history": {"t": now_ts(), "type": "buy_ratio", "orders": pairs, "spent": spent}}}
+                )
+                return await inter.followup.send(
+                    "✅ **Ratio Purchase**\n" + "\n".join(lines) +
+                    f"\n**Total**: {fmt_price(spent)}\n**Unspent Cash**: {fmt_price(new_cash)}"
+                )
+
+            # ----- Normal mode (',' or '|') : Same Logic -----
+            pairs = _parse_orders(orders)  # [(ident, qty), ...]
+            total_cost = 0
+            applied: list[str] = []
+
+            for ident, qty in pairs:
+                code = _resolve_item_code(items, ident)
+                if not code:
+                    return await inter.followup.send(f"❌ Unknown item: `{ident}`")
+                px = _shown_price(items[code], use_next)
+                cost = px * qty
+                total_cost += cost
+                new_qty = int(holdings.get(code, 0)) + qty
+                if new_qty > MAX_ITEM_UNITS:
+                    return await inter.followup.send(f"❌ Max units per item is {MAX_ITEM_UNITS} (violated by {code}).")
+                holdings[code] = new_qty
+                applied.append(f"{code} × {qty} @ {fmt_price(px)} = {fmt_price(cost)}")
+
+            if total_cost > cash:
+                return await inter.followup.send(
+                    f"❌ Not enough cash. Need {fmt_price(total_cost)}, you have {fmt_price(cash)}."
+                )
+
+            new_cash = cash - total_cost
+            await _ports().update_one(
+                {"_id": uid},
+                {"$set": {"cash": new_cash, "holdings": holdings, "updated_at": now_ts()},
+                 "$push": {"history": {"t": now_ts(), "type": "buy", "orders": pairs}}}
             )
-    
-        new_cash = cash - total_cost
-        await _ports().update_one(
-            {"_id": uid},
-            {"$set": {"cash": new_cash, "holdings": holdings, "updated_at": now_ts()},
-             "$push": {"history": {"t": now_ts(), "type": "buy", "orders": pairs}}}
-        )
-        await inter.followup.send(
-            "✅ Bought:\n" + "\n".join(applied) +
-            f"\n**Total**: {fmt_price(total_cost)}\n**Unspent Cash**: {fmt_price(new_cash)}"
-        )
+            await inter.followup.send(
+                "✅ Bought:\n" + "\n".join(applied) +
+                f"\n**Total**: {fmt_price(total_cost)}\n**Unspent Cash**: {fmt_price(new_cash)}"
+            )
+
+        except ValueError as e:
+            await inter.followup.send(f"❌ {e}")
 
     # ---- sell --------------------------------------------------------------
     @market_root.subcommand(name="sell", description="Sell items.")
@@ -424,47 +452,73 @@ def setup(bot: commands.Bot):
     @market_root.subcommand(name="admin_buy", description="OWNER: Buy items for a player.")
     @guard(require_private=True, public=True, require_unlocked=True, owner_only=True)
     async def market_admin_buy(inter: Interaction, user: Member, orders: str):
-        
         if not await _enforce_market_channel(inter):
             return
-        
         if not inter.response.is_done():
             await inter.response.defer()
-        
-        cfg = await _get_config(); items = cfg["items"]
+
+        cfg = await _get_config()
+        items = cfg["items"]
+        use_next = bool(cfg.get("use_next_for_total"))
+
         uid = str(user.id)
-        use_next = bool((await _get_config()).get("use_next_for_total"))
         pf = await _ports().find_one({"_id": uid})
         if not pf:
-            return await inter.followup.send(f"❌ {user.mention} has no Inventory.")
-        try:
-            pairs = _parse_orders(orders)
-        except ValueError as e:
-            return await inter.followup.send(f"❌ {e}")
-    
-        holdings = dict(pf.get("holdings", {}) or {})
+            return await inter.followup.send(f"❌ The specified user has no Inventory.")
+
         cash = int(pf.get("cash", 0))
-        total_cost = 0
-        lines: List[str] = []
-    
-        for ident, qty in pairs:
-            code = _resolve_item_code(items, ident)
-            if not code:
-                lines.append(f"❌ Unknown item: {ident}")
-                continue
-            px = _shown_price(items[code], use_next)
-            cost = px * qty
-            holdings[code] = int(holdings.get(code, 0)) + qty
-            cash -= cost
-            total_cost += cost
-            lines.append(f"✅ {code}: +{qty} @ {fmt_price(px)}")
-    
-        await _ports().update_one({"_id": uid},
-            {"$set": {"holdings": holdings, "cash": cash, "updated_at": now_ts()}}
-        )
-        await inter.followup.send(
-            "\n".join(lines) + f"\n**Total**: -{fmt_price(total_cost)}\n**Unspent Cash**: {fmt_price(cash)}"
-        )
+        holdings = dict(pf.get("holdings", {}) or {})
+
+        try:
+            # ----- Ratio mode for admin -----
+            if detect_ratio_mode(orders):
+                if cash <= 0:
+                    return await inter.followup.send("❌ Player has no Unspent Cash.")
+                pairs = parse_ratio_orders(orders)
+                lines, new_holdings, spent = ratio_buy_plan(
+                    items_cfg=items, use_next=use_next,
+                    holdings_now=holdings, cash_now=cash, pairs=pairs,
+                )
+                if spent <= 0:
+                    return await inter.followup.send("❌ Nothing could be purchased with the given ratios.")
+                new_cash = cash - spent
+                await _ports().update_one(
+                    {"_id": uid},
+                    {"$set": {"cash": new_cash, "holdings": new_holdings, "updated_at": now_ts()},
+                     "$push": {"history": {"t": now_ts(), "type": "admin_buy_ratio", "by": str(inter.user.id), "orders": pairs, "spent": spent}}}
+                )
+                return await inter.followup.send(
+                    f"✅ **Ratio Purchase for {user.mention}**\n" + "\n".join(lines) +
+                    f"\n**Total**: {fmt_price(spent)}\n**Unspent Cash**: {fmt_price(new_cash)}"
+                )
+
+            # ----- Normal mode -----
+            pairs = _parse_orders(orders)
+            total_cost = 0
+            lines: List[str] = []
+            for ident, qty in pairs:
+                code = _resolve_item_code(items, ident)
+                if not code:
+                    lines.append(f"❌ Unknown item: {ident}")
+                    continue
+                px = _shown_price(items[code], use_next)
+                cost = px * qty
+                holdings[code] = int(holdings.get(code, 0)) + qty
+                cash -= cost
+                total_cost += cost
+                lines.append(f"✅ {code}: +{qty} @ {fmt_price(px)}")
+
+            await _ports().update_one(
+                {"_id": uid},
+                {"$set": {"holdings": holdings, "cash": cash, "updated_at": now_ts()}}
+            )
+            await inter.followup.send(
+                "\n".join(lines) + f"\n**Total**: -{fmt_price(total_cost)}\n**Unspent Cash**: {fmt_price(cash)}"
+            )
+
+        except ValueError as e:
+            await inter.followup.send(f"❌ {e}")
+
     # ---- admin sell ----------------------------------------------------
     @market_root.subcommand(name="admin_sell", description="OWNER: Sell items for a player.")
     @guard(require_private=True, public=True, require_unlocked=True, owner_only=True)
@@ -481,7 +535,7 @@ def setup(bot: commands.Bot):
         use_next = bool((await _get_config()).get("use_next_for_total"))
         pf = await _ports().find_one({"_id": uid})
         if not pf:
-            return await inter.followup.send(f"❌ {user.mention} has no Inventory.")
+            return await inter.followup.send(f"❌ The specified user has no Inventory.")
         try:
             pairs = _parse_orders(orders)
         except ValueError as e:
@@ -529,7 +583,7 @@ def setup(bot: commands.Bot):
         uid = str(user.id)
         pf = await _ports().find_one({"_id": uid})
         if not pf:
-            return await inter.followup.send(f"❌ {user.mention} doesn't have an Inventory.")
+            return await inter.followup.send(f"❌ The specified user doesn't have an Inventory.")
 
         cfg = await _get_config()
         items = cfg["items"]
@@ -688,7 +742,7 @@ def setup(bot: commands.Bot):
         uid = str(user.id)
         pf = await _ports().find_one({"_id": uid})
         if not pf:
-            return await inter.followup.send(f"❌ {user.mention} has no Inventory.")
+            return await inter.followup.send(f"❌ The specified user has no Inventory.")
 
         # zero holdings; force cash
         zero_holdings = {c: 0 for c in (pf.get("holdings") or {}).keys()}

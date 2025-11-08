@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Dict
+from typing import Dict, Optional
 from decimal import Decimal, ROUND_HALF_UP
 
 from nextcord.ext import commands
-from nextcord import Interaction, SlashOption, Embed, ButtonStyle
+from nextcord import Interaction, SlashOption, Embed, ButtonStyle, ui
 from nextcord.ui import View, Button
 
 from cramesia_SS.db import db
@@ -19,6 +19,7 @@ from cramesia_SS.utils.time import now_ts
 from cramesia_SS.utils.text import round_half_up_int, fmt_price
 from cramesia_SS.services.market_math import calculate_odds
 from cramesia_SS.services.snapshots import snapshot_pre_reveal, snapshot_liquidate  # both exist in your services
+from cramesia_SS.services.generator import generate_preview_or_commit, build_preview_embed, commit_preview, compute_rhint_odds, compute_owner_odds
 
 # ---- collection helpers -----------------------------------------------------
 def _cfg():      # singleton config: {"_id":"current", items, use_next_for_total?, next_year?, game_mode? ...}
@@ -120,148 +121,212 @@ def setup(bot: commands.Bot):
     async def stock_change_cmd(inter: Interaction):
         pass  # group root
 
-    # ---------- /stock_change set (mode-aware domain) -----------------------
+    # ---------- NEW: /stock_change generate ---------------------------------
     @stock_change_cmd.subcommand(
-        name="set",
-        description="Owner: set 8 % changes (A–H) for a year. Example: -10 5 0 40 -20 0 10 15",
+        name="generate",
+        description="OWNER: Generate 8 random changes with ETU Preview, then confirm."
     )
     @guard(require_private=False, public=True, owner_only=True)
-    async def stock_change_set(
-        inter: Interaction,
-        changes: str = SlashOption(description="8 integers separated by spaces", required=True),
-        year: int = SlashOption(description="Year the changes apply to", required=True),
-    ):
-        # behavior & validation as in monolith
+    async def stock_change_generate(inter: Interaction):
+        """
+        No options version.
+        - Year is auto-determined internally (2..11).
+        - RNG seed is internal; no manual override.
+        - No commit notes or override flags.
+        """
         if not inter.response.is_done():
             await inter.response.defer(ephemeral=True)
 
-        parts = [p.strip() for p in changes.split()]
-        if len(parts) != 8:
-            return await inter.followup.send("❌ Provide exactly **8** changes separated by spaces.")
+        # Generate preview (dry-run)
         try:
-            vals = [int(x) for x in parts]
-        except ValueError:
-            return await inter.followup.send("❌ All changes must be integers (e.g., -10, 0, 25).")
-
-        mode = await _mode()
-        allowed = set(ODDS_APOC.keys()) if mode == "apocalypse" else set(ODDS.keys())
-        bad = [v for v in vals if v not in allowed]
-        if bad:
-            return await inter.followup.send(f"❌ Invalid values for mode `{mode}`: {sorted(set(bad))}")
-
-        # write the year doc A..H -> % ints
-        payload = {ITEM_CODES[i]: vals[i] for i in range(8)}
-        await _changes().update_one({"_id": int(year)}, {"$set": payload}, upsert=True)
-
-        lines = [f"{c}: {payload[c]}%" for c in ITEM_CODES]
-        await inter.followup.send(
-            embed=Embed(
-                title=f"Year {year} — Changes",
-                description="\n".join(lines),
-                colour=bot_colour(),
+            preview = await generate_preview_or_commit(
+                year=None,      # auto 2..11
+                dry_run=True    # preview mode
             )
-        )
+        except Exception as e:
+            return await inter.followup.send(f"❌ Generate failed: {e}", ephemeral=True)
 
-    # ---------- /stock_change odds -----------------------------------------
-    @stock_change_cmd.subcommand(name="odds", description="Owner: compute odds from historical changes.")
+        class GenerateView(View):
+            """
+            Buttons:
+            - Confirm & Save (locks the season entry)
+            - Re-roll (re-generate preview with same auto rules)
+            - Cancel (close the prompt)
+            """
+            def __init__(self, params: dict, doc: dict):
+                super().__init__(timeout=180)
+                self.params = params      # {'year': None, 'dry_run': True/False}
+                self.doc = doc            # preview document
+
+            async def interaction_check(self, btn_inter: Interaction) -> bool:
+                # Only the invoker (owner) can press buttons
+                if btn_inter.user.id != inter.user.id:
+                    await btn_inter.response.send_message("Owner only.", ephemeral=True)
+                    return False
+                return True
+
+            async def _render(self) -> Embed:
+                return build_preview_embed(self.doc)
+
+            @ui.button(label="✅ Confirm & Save (Lock)", style=ButtonStyle.success)
+            async def confirm(self, button: ui.Button, btn_inter: Interaction):
+                await btn_inter.response.defer()
+                try:
+                    # 🔒 Commit exactly what is in self.doc (no RNG rerun)
+                    saved = await commit_preview(self.doc)
+                except Exception as e:
+                    return await btn_inter.followup.send(f"❌ Save failed: {e}", ephemeral=True)
+        
+                # Remove the view and finalize
+                await btn_inter.edit_original_message(
+                    content=f"✅ Saved & locked — Year **{saved['year']}**",
+                    embed=None, view=None
+                )
+                self.stop()
+
+            @ui.button(label="🎲 Re-roll", style=ButtonStyle.secondary)
+            async def reroll(self, _btn: Button, btn_inter: Interaction):
+                await btn_inter.response.defer()
+                # Re-generate preview
+                self.params["dry_run"] = True
+                self.doc = await generate_preview_or_commit(**self.params)
+                e = await self._render()
+                await btn_inter.edit_original_message(embed=e, view=self)
+
+            @ui.button(label="✖ Cancel", style=ButtonStyle.danger)
+            async def cancel(self, button: ui.Button, btn_inter: Interaction):
+                # First response must edit the original component message
+                try:
+                    await btn_inter.response.edit_message(content="Canceled.", embed=None, view=None)
+                except Exception:
+                    await btn_inter.edit_original_message(content="Canceled.", embed=None, view=None)
+                self.stop()
+
+        # Params now contain only what the service expects
+        params = dict(year=None, dry_run=True)
+        view = GenerateView(params, preview)
+        embed = build_preview_embed(preview)
+        await inter.followup.send(embed=embed, view=view, ephemeral=True)
+
+
+    # ---------- /stock_change odds  -----------------------------------
+    @stock_change_cmd.subcommand(
+        name="odds",
+        description="Owner: show R-hint (n-1) and Owner odds (n) from locked (DB) history."
+    )
     @guard(require_private=False, public=True, owner_only=True)
     async def stock_change_odds(inter: Interaction):
-        # defer once
         if not inter.response.is_done():
             await inter.response.defer(ephemeral=True)
-
-        # fetch changes & items
-        years = [doc async for doc in _changes().find({})]
-        years.sort(key=lambda d: d["_id"])
-        items_cfg = (await _get_market_config() or {}).get("items", {})
-
-        # R-hint (exclude latest year)
-        r_text = "No historical data yet."
-        if len(years) >= 2:
-            r_years = years[:-1]
-            r_odds = calculate_odds(r_years)
-            r_lines = [f"{_item_label(code, items_cfg)}: {r_odds.get(code, 50)}%" for code in ITEM_CODES]
-            r_text = "R-hint (excludes latest year changes)\n\n" + "\n".join(r_lines)
+    
+        # 0) 항목 이름표
+        cfg = await _cfg().find_one({"_id": "current"}, {"items": 1})
+        items_cfg = (cfg or {}).get("items", {})
+    
+        # 1) 최신 DB(locked) 기준 연도 계산  ← lry(정산) 말고!
+        locked_docs = [d async for d in _changes().find({"locked": True}, {"_id": 1})]
+        locked_docs.sort(key=lambda d: int(d["_id"]))
+        ldb = max([int(x["_id"]) for x in locked_docs], default=0)     # n = 최신 locked 연도
+        locked_count = len(locked_docs)
+    
+        def _lbl_n()   -> str: return f"Year {ldb}"   if ldb >= 1 else "—"
+        def _lbl_nm1() -> str: return f"Year {ldb-1}" if ldb >= 2 else "—"
+    
+        # 2) 계산은 services.generator 쪽 헬퍼(이미 DB 기준) 사용
+        r_map = await compute_rhint_odds()   # n-1 계산 (최신 locked 제외)
+        o_map = await compute_owner_odds()   # n 계산   (n-1 + 최신 locked 보정)
+    
+        # 3) 출력 (히스토리 유무 판단도 locked 기준)
+        if locked_count < 2:
+            r_text = f"R-hint (n-1 = {_lbl_nm1()})\n\nNo historical data yet."
         else:
-            r_text = "R-hint (excludes latest year changes)\n\nNo historical data yet."
-
-        # Owner odds (include latest year)
-        if years:
-            owner = calculate_odds(years)
-            owner_lines = [f"{_item_label(code, items_cfg)}: {owner.get(code, 50)}%" for code in ITEM_CODES]
-        else:
-            owner_lines = [f"{_item_label(code, items_cfg)}: 50%" for code in ITEM_CODES]
-
-        owner_text = "Owner odds (includes latest year)\n\n" + "\n".join(owner_lines)
-
-        await inter.followup.send(f"{r_text}\n\n{owner_text}")
+            r_lines = [f"{_item_label(code, items_cfg)}: {int(r_map.get(code, 50))}%"
+                       for code in ITEM_CODES]
+            r_text = f"R-hint (n-1 = {_lbl_nm1()})\n\n" + "\n".join(r_lines)
+    
+        o_lines = [f"{_item_label(code, items_cfg)}: {int(o_map.get(code, 50))}%"
+                   for code in ITEM_CODES]
+        o_text = f"Owner odds (n = {_lbl_n()})\n\n" + "\n".join(o_lines)
+    
+        await inter.followup.send(f"{r_text}\n\n{o_text}")
+    
 
     # ---------- /stock_change reveal_next ----------------------------------
     @stock_change_cmd.subcommand(
         name="reveal_next",
-        description="Owner: project next-year prices from a set year and switch portfolio totals to NEXT.",
+        description="Owner: Reveal ONLY the immediate next year's prices (sequential); switches totals to NEXT.",
     )
     @guard(require_private=False, public=True, owner_only=True)
     async def stock_change_reveal_next(
         inter: Interaction,
-        year: int = SlashOption(description="Year to project", required=True),
         confirm: str = SlashOption(description="Type CONFIRM to proceed.", required=True),
     ):
-        # behavior & validation as in monolith
+        from datetime import datetime
+
         if not inter.response.is_done():
             await inter.response.defer(ephemeral=True)
-        
+
         if confirm != "CONFIRM":
             return await inter.followup.send("❌ Type `CONFIRM` to proceed.")
 
-        ch = await _get_changes_for_year(year)
-        if not ch:
-            return await inter.followup.send(f"❌ No changes found for {year}. Set them first with /stock_change set.")
-
         cfg_col = _cfg()
-        cfg = await cfg_col.find_one({"_id": "current"})
-        if not cfg or "items" not in cfg:
+        cfg = await cfg_col.find_one({"_id": "current"}) or {}
+        items = (cfg.get("items") or {})
+        if not items:
             return await inter.followup.send("❌ Market is not configured.")
 
-        # snapshot (pre-reveal)
-        await snapshot_pre_reveal(int(year))
+        if cfg.get("use_next_for_total"):
+            ny = cfg.get("next_year")
+            return await inter.followup.send(
+                f"❌ NEXT totals already active for **{ny}**. "
+                "Run `/stock_change liquidate` (or revert) before revealing again."
+            )
 
-        # inside stock_change_reveal_next, when computing each item's next_price
-        items = cfg["items"]
+        last_result_year = int(cfg.get("last_result_year") or 1)
+        expected_year = last_result_year + 1
+
+        ch = await _get_changes_for_year(expected_year)
+        if not ch:
+            return await inter.followup.send(
+                f"❌ No changes found for **{expected_year}**. "
+                f"Set them first with `/stock_change set year:{expected_year}` (or `/stock_change generate`)."
+            )
+
+        await snapshot_pre_reveal(int(expected_year))
 
         preview_lines = []
         for code in ITEM_CODES:
-            # use the SHOWN price (next_price if present, otherwise price)
-            shown_before = int((items.get(code) or {}).get("next_price") or items[code]["price"])
-
+            info = (items.get(code) or {})
+            base_price = int(info.get("price", 0))
             pct = int(ch.get(code, 0))
-            new_next = _price_with_change(shown_before, pct)
+            new_next = _price_with_change(base_price, pct)
+            info["next_price"] = new_next
+            items[code] = info
 
-            items[code]["next_price"] = new_next
-
-            # build preview from shown_before
             preview_lines.append(
-                f"{code}: {items[code]['name']} — {fmt_price(shown_before)} → **{fmt_price(new_next)}** ({pct:+d}%)"
+                f"{code}: {info.get('name', code)} — "
+                f"{fmt_price(base_price)} → **{fmt_price(new_next)}** ({pct:+d}%)"
             )
 
-        # flip flag to use NEXT for totals
         await cfg_col.update_one(
             {"_id": "current"},
             {"$set": {
                 "items": items,
                 "use_next_for_total": True,
-                "next_year": int(year),
+                "next_year": int(expected_year),
                 "updated_at": int(datetime.now().timestamp()),
             }},
+            upsert=True,
         )
 
         await inter.followup.send(
             embed=Embed(
-                title=f"Next-Year Revealed — {year}",
+                title=f"Next-Year Revealed — {expected_year}",
                 description="\n".join(preview_lines),
                 colour=bot_colour(),
             )
         )
+
 
     # ---------- /stock_change view ------------------------------------
         
@@ -493,7 +558,7 @@ def setup(bot: commands.Bot):
                     return False
                 return True
 
-            @Button(label="Confirm Cut (3 players)", style=ButtonStyle.danger)
+            @ui.button(label="Confirm Cut (3 players)", style=ButtonStyle.danger)
             async def confirm(self, _btn: Button, btn_inter: Interaction):
                 await btn_inter.response.defer()
                 # re-validate
